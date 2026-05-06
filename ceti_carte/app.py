@@ -44,7 +44,7 @@ with col_params:
     )
     urbanisme = st.text_area(
         "Document d'urbanisme applicable",
-        placeholder="Exemple :\nPLU d'Amillis \nZone : Ns (naturelle spéciale)",
+        placeholder="Exemple : PLU d'Amillis, Zone Ns (naturelle spéciale)",
         height=110,
         help="Texte libre affiché dans l'encart en haut à droite de la carte. Laisser vide si non renseigné."
     )

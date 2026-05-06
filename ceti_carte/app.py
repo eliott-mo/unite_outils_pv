@@ -42,16 +42,14 @@ with col_params:
         placeholder="ex : Nom de la commune",
         help="Sera repris dans le titre de la carte et dans le nom du fichier."
     )
-
-    st.subheader("3 · Urbanisme")
     urbanisme = st.text_area(
         "Document d'urbanisme applicable",
-        placeholder="ex :\nPLU d'Amillis \nZone : Ns (naturelle spéciale)",
+        placeholder="Exemple :\nPLU d'Amillis \nZone : Ns (naturelle spéciale)",
         height=110,
         help="Texte libre affiché dans l'encart en haut à droite de la carte. Laisser vide si non renseigné."
     )
 
-    st.subheader("4 · Paramètres")
+    st.subheader("3 · Paramètres")
     recul = st.slider(
         "Recul zone capteurs PV (m)",
         min_value=0, max_value=50, value=10, step=1,

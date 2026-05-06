@@ -29,9 +29,9 @@ col_params, col_result = st.columns([1, 2], gap="large")
 with col_params:
 
     # 1. Upload shapefile
-    st.subheader("1 · Fichier shapefile")
+    st.subheader("1 · Shapefile")
     zip_file = st.file_uploader(
-        "Déposer le .zip contenant le shapefile (export de Géoperso)",
+        "Déposer le dossier .zip contenant le shapefile de la zone d'implantation (export de Géoperso)",
         type=["zip"],
         help="Le zip doit contenir les fichiers .shp, .dbf, .prj et .shx du terrain d'implantation."
     )
@@ -39,7 +39,7 @@ with col_params:
     st.subheader("2 · Informations projet")
     nom_projet = st.text_input(
         "Nom du projet",
-        placeholder="ex : Nom de la commune",
+        placeholder="Exemple : Amillis",
         help="Sera repris dans le titre de la carte et dans le nom du fichier."
     )
     urbanisme = st.text_area(

@@ -31,7 +31,7 @@ with col_params:
     # 1. Upload shapefile
     st.subheader("1 · Fichier shapefile")
     zip_file = st.file_uploader(
-        "Déposer le .zip contenant le shapefile",
+        "Déposer le .zip contenant le shapefile (export de Géoperso)",
         type=["zip"],
         help="Le zip doit contenir les fichiers .shp, .dbf, .prj et .shx du terrain d'implantation."
     )
@@ -39,23 +39,23 @@ with col_params:
     st.subheader("2 · Informations projet")
     nom_projet = st.text_input(
         "Nom du projet",
-        placeholder="ex : EMO 21 — Gissey / Darcey",
+        placeholder="ex : Nom de la commune",
         help="Sera repris dans le titre de la carte et dans le nom du fichier."
     )
 
     st.subheader("3 · Urbanisme")
     urbanisme = st.text_area(
         "Document d'urbanisme applicable",
-        placeholder="ex :\nPLU de Gissey-sous-Flavigny\napprouvé le 15/03/2022\nZone : Ns (naturelle spéciale)",
+        placeholder="ex :\nPLU d'Amillis \nZone : Ns (naturelle spéciale)",
         height=110,
         help="Texte libre affiché dans l'encart en haut à droite de la carte. Laisser vide si non renseigné."
     )
 
     st.subheader("4 · Paramètres")
     recul = st.slider(
-        "Recul zone capteurs (m)",
+        "Recul zone capteurs PV (m)",
         min_value=0, max_value=50, value=10, step=1,
-        help="Buffer négatif appliqué au terrain d'implantation pour délimiter la zone des capteurs."
+        help="Buffer négatif appliqué au terrain d'implantation pour délimiter la zone des capteurs PV au sens du CdC de la CRE."
     )
     fond_aerien = st.toggle(
         "Fond aérien IGN Géoportail",

@@ -35,12 +35,12 @@ with col_params:
     st.subheader("2 · Informations projet")
     nom_projet = st.text_input(
         "Nom du projet",
-        placeholder="Exemple : Amillis",
+        placeholder="Futur lauréat CRE",
         help="Sera repris dans le titre de la carte et dans le nom du fichier."
     )
     urbanisme = st.text_area(
-        "Document d'urbanisme applicable",
-        placeholder="Exemple : PLU d'Amillis, Zone Ns (naturelle spéciale)",
+        "Document d'urbanisme applicable. Bien rensigner les informations pour l'ensemble des parcelles du terrain d'implantation",
+        placeholder="L'urbanisme c'est super",
         height=110,
         help="Texte libre affiché dans l'encart en haut à droite de la carte. Laisser vide si non renseigné."
     )
@@ -60,12 +60,12 @@ with col_params:
     if zh_presence == "Oui":
         st.info("ℹ️ Le CDC impose d'afficher les zones humides, les panneaux, les pistes et les locaux techniques sur la carte.")
         zh_file = st.file_uploader(
-            "Couche zones humides (.zip shapefile, .kml ou .geojson)",
+            "Couche zones humides (.zip shapefile, .kml ou .geojson) - fournie par le BE enviro",
             type=["zip", "kml", "geojson", "json"],
             help="Fichier fourni par le BE environnemental. Formats acceptés : shapefile zippé, KML, GeoJSON."
         )
         elements_file = st.file_uploader(
-            "Couche éléments techniques — panneaux, pistes, locaux (.kml)",
+            "Couche éléments techniques — panneaux, pistes, locaux (.kml) - fournie en un KML par notre BE interne. Ne doit contenir QUE les trois éléments mentionnés.",
             type=["kml"],
             help="Fichier KML fourni par le BE technique, contenant panneaux (polygones), pistes (lignes) et locaux (points)."
         )

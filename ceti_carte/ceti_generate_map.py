@@ -239,7 +239,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     # Encart urbanisme
     if urbanisme.strip():
         ax.text(x1 - geo_w * 0.02, y1 - geo_h * 0.02,
-                "Urbanisme\n{}\n{}".format("\u2500" * 22, urbanisme),
+                "Urbanisme\n{}\n{}".format("\u2500" * 30, urbanisme),
                 ha="right", va="top", fontsize=8, linespacing=1.7,
                 bbox=dict(boxstyle="round,pad=0.6", fc="white", alpha=0.93, ec="#aaaaaa", lw=0.8), zorder=9)
 

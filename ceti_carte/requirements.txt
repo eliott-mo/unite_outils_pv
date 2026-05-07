@@ -6,3 +6,4 @@ numpy
 contextily
 rasterio
 streamlit
+fiona

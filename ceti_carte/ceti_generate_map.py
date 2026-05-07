@@ -241,7 +241,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         ax.text(x1 - geo_w * 0.02, y1 - geo_h * 0.02,
                 "Urbanisme\n{}\n{}".format("\u2500" * 22, urbanisme),
                 ha="right", va="top", fontsize=10, linespacing=1.7,
-                bbox=dict(boxstyle="round,pad=0.6", fc="white", alpha=0.93, ec="#CC0000", lw=1.5), zorder=9)
+                bbox=dict(boxstyle="round,pad=0.6", fc="white", alpha=0.93, ec="#CC0000", lw=2.5), zorder=9)
 
     # Axes WGS84
     _tr_wgs = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)

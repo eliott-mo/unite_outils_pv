@@ -515,30 +515,39 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
             bx0, by0, bx1, by1 = terrain.bounds
         gdf_plu = charger_zones_urbanisme(bx0, by0, bx1, by1)
 
-    if gdf_plu is not None:
-        # Geometrie de clipping selon les cases cochees
+    # Déterminer la géométrie de clipping une seule fois
+    if urba_terrain or urba_buffer:
         if urba_terrain and urba_buffer:
             clip_geom = buf600
         elif urba_terrain:
             clip_geom = terrain
         else:
             clip_geom = buf600
+    else:
+        clip_geom = None
 
+    if gdf_plu is None and clip_geom is not None:
+        # ── API indisponible : pas de couleur, pas de hachure ───────────────
+        # Conformément à la demande : "pas d'info = pas de couleur"
+        # On laisse la zone sans remplissage, juste la note en légende
+        pass   # rien à tracer, la note "Sans couleur = info non disponible" suffira
+
+    if gdf_plu is not None and clip_geom is not None:
         if len(gdf_plu) == 0:
-            # ── Commune sous RNU : aucune zone numerisee ────────────────────
+            # ── Commune sous RNU : hachure grise ────────────────────────────
             rnu_detecte = True
             draw_hatch(ax, clip_geom,
                        ec="#999999", fc="#CCCCCC", hatch="////",
-                       alpha_fill=0.20, lw=0.8, zorder=1)
+                       alpha_fill=0.25, lw=0.8, zorder=1)
             rnu_pt = clip_geom.representative_point()
             ax.text(rnu_pt.x, rnu_pt.y, "RNU",
-                    fontsize=13, fontweight="bold", color="#777777",
+                    fontsize=13, fontweight="bold", color="#555555",
                     ha="center", va="center",
                     bbox=dict(boxstyle="round,pad=0.45", fc="white",
-                              alpha=0.88, ec="#999999", lw=1.2),
+                              alpha=0.90, ec="#999999", lw=1.2),
                     zorder=20)
 
-        else:
+        elif len(gdf_plu) > 0:
             # ── PLU numerise : dessiner chaque zone ─────────────────────────
             col_type = "typezone" if "typezone" in gdf_plu.columns else None
             col_lib  = "libelle"  if "libelle"  in gdf_plu.columns else None
@@ -606,7 +615,49 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                                 zorder=20, clip_on=True)
 
 
-    # ── Couches de base ───────────────────────────────────────────────────────
+    # ── Zones non couvertes par le PLU = RNU ou hors périmètre GPU ─────────
+    # On calcule la différence entre l'emprise clippée et l'union des zones PLU tracées
+    if clip_geom is not None and gdf_plu is not None and len(gdf_plu) > 0:
+        try:
+            zones_plu_tracees = []
+            for _, row in gdf_plu.iterrows():
+                g = row.geometry
+                if g is None or g.is_empty:
+                    continue
+                try:
+                    g = g.intersection(clip_geom)
+                except Exception:
+                    continue
+                if g and not g.is_empty:
+                    zones_plu_tracees.append(g)
+
+            if zones_plu_tracees:
+                couverture_plu = unary_union(zones_plu_tracees)
+                zone_non_couverte = clip_geom.difference(couverture_plu)
+            else:
+                zone_non_couverte = clip_geom
+
+            # N'afficher le gris RNU que si la zone non couverte est significative
+            SEUIL_RNU_M2 = 10000   # 1 ha minimum pour afficher
+            if not zone_non_couverte.is_empty and zone_non_couverte.area > SEUIL_RNU_M2:
+                rnu_detecte = True
+                draw_hatch(ax, zone_non_couverte,
+                           ec="#999999", fc="#CCCCCC", hatch="////",
+                           alpha_fill=0.25, lw=0.8, zorder=1)
+                # Label RNU centré sur la zone non couverte
+                rnu_pt = zone_non_couverte.representative_point()
+                rx, ry = float(rnu_pt.x), float(rnu_pt.y)
+                if x0 <= rx <= x1 and y0 <= ry <= y1:
+                    ax.text(rx, ry, "RNU",
+                            fontsize=11, fontweight="bold", color="#555555",
+                            ha="center", va="center",
+                            bbox=dict(boxstyle="round,pad=0.40", fc="white",
+                                      alpha=0.90, ec="#999999", lw=1.0),
+                            zorder=20)
+        except Exception as e:
+            print("Calcul zone RNU échoué : {}".format(e))
+
+        # ── Couches de base ───────────────────────────────────────────────────────
     # Périmètre 600m — halo sombre + trait blanc pour lisibilité sur fond aérien
     draw_geom(ax, buf600, fc="none", ec="#333333", lw=3.5, alpha_fill=0, ls=(0,(4,5)), zorder=2)
     draw_geom(ax, buf600, fc="none", ec="#FFFFFF", lw=1.8, alpha_fill=0, ls=(0,(4,5)), zorder=2)
@@ -724,7 +775,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         )
     # Note en bas si PLU demandé (disclaimer données GPU)
     _NOTE = "Sans couleur = info non disponible (Géoportail de l'Urbanisme)"
-    _show_note = (urba_terrain or urba_buffer) and gdf_plu is not None
+    _show_note = (urba_terrain or urba_buffer)
     if _show_note:
         legend_items.append(
             mlines.Line2D([], [], color="none", linewidth=0, label=_NOTE)
@@ -751,7 +802,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     # ── Encart urbanisme ──────────────────────────────────────────────────────
     if urbanisme.strip():
         ax.text(x1 - geo_w * 0.02, y1 - geo_h * 0.02,
-                "Document d'urbanisme applicable\n{}\n{}".format("\u2500" * 22, urbanisme),
+                "Document d'urbanisme applicable\nau terrain d'implantation{}\n{}".format("\u2500" * 22, urbanisme),
                 ha="right", va="top", fontsize=10, weight="bold", linespacing=1.7,
                 bbox=dict(boxstyle="round,pad=0.6", fc="white",
                           alpha=0.93, ec="#CC0000", lw=2.5), zorder=11)

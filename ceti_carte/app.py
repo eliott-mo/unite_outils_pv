@@ -10,13 +10,13 @@ import streamlit as st
 from ceti_generate_map import generer_carte
 
 st.set_page_config(
-    page_title="Générateur de carte CETI — UNITe PV",
+    page_title="CETI - Générateur plan de situation",
     page_icon="🗺️",
     layout="wide",
 )
 
-st.title("🗺️ Générateur de carte de situation CETI")
-st.caption("AO CRE PV Sol · Période 9 · UNITe")
+st.title("🗺️ CETI - Générateur plan de situation")
+st.caption("AO CRE PV Sol · Compatible CdC Période 9 · UNITe")
 st.divider()
 
 col_params, col_result = st.columns([1, 2], gap="large")
@@ -65,7 +65,7 @@ with col_params:
             help="Fichier fourni par le BE environnemental. Formats acceptés : shapefile zippé, KML, GeoJSON."
         )
         elements_file = st.file_uploader(
-            "Couche éléments techniques — panneaux, pistes, locaux (.kml) — optionnel",
+            "Couche éléments techniques — UNIQUEMENT panneaux, pistes, locaux (.kml)",
             type=["kml"],
             help="Fichier KML fourni par le BE technique, contenant panneaux (polygones), pistes (lignes) et locaux (points)."
         )

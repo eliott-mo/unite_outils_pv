@@ -802,7 +802,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     # ── Encart urbanisme ──────────────────────────────────────────────────────
     if urbanisme.strip():
         ax.text(x1 - geo_w * 0.02, y1 - geo_h * 0.02,
-                "Document d'urbanisme applicable\nau terrain d'implantation{}\n{}".format("\u2500" * 22, urbanisme),
+                "Document d'urbanisme applicable\nau terrain d'implantation\n{}\n{}".format("\u2500" * 10, urbanisme),
                 ha="right", va="top", fontsize=10, weight="bold", linespacing=1.7,
                 bbox=dict(boxstyle="round,pad=0.6", fc="white",
                           alpha=0.93, ec="#CC0000", lw=2.5), zorder=11)

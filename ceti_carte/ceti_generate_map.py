@@ -843,7 +843,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         fontsize=15, fontweight="bold", pad=16)
 
     # ── Logo UNITe (haut-droite, meme hauteur que le titre) ───────────────────
-    _LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo unite.png")
+    _LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo_unite.png")
     if os.path.exists(_LOGO):
         from PIL import Image as _PILImg
         _logo = _PILImg.open(_LOGO).convert("RGBA")

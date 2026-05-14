@@ -35,12 +35,12 @@ with col_params:
     st.subheader("2 · Informations projet")
     nom_projet = st.text_input(
         "Nom du projet",
-        placeholder="Futur lauréat CRE",
+        placeholder="Nom Commune (Département)",
         help="Sera repris dans le titre de la carte et dans le nom du fichier."
     )
     urbanisme = st.text_area(
-        "Document d'urbanisme applicable. Bien rensigner les informations pour l'ensemble des parcelles du terrain d'implantation",
-        placeholder="L'urbanisme c'est super",
+        "Document d'urbanisme applicable",
+        placeholder="RNU / PLU / PLUi / Carte Communale",
         height=110,
         help="Texte libre affiché dans l'encart en haut à droite de la carte. Laisser vide si non renseigné."
     )
@@ -60,17 +60,16 @@ with col_params:
     if zh_presence == "Oui":
         st.info("ℹ️ Le CDC impose d'afficher les zones humides, les panneaux, les pistes et les locaux techniques sur la carte.")
         zh_file = st.file_uploader(
-            "Couche zones humides (.zip shapefile, .kml ou .geojson) - fournie par le BE enviro",
+            "Couche zones humides (.zip shapefile, .kml ou .geojson)",
             type=["zip", "kml", "geojson", "json"],
             help="Fichier fourni par le BE environnemental. Formats acceptés : shapefile zippé, KML, GeoJSON."
         )
         elements_file = st.file_uploader(
-            "Couche éléments techniques — panneaux, pistes, locaux (.kml) - fournie en un KML par notre BE interne. Ne doit contenir QUE les trois éléments mentionnés.",
+            "Couche éléments techniques — panneaux, pistes, locaux (.kml) — optionnel",
             type=["kml"],
             help="Fichier KML fourni par le BE technique, contenant panneaux (polygones), pistes (lignes) et locaux (points)."
         )
 
-    # ── 4. Paramètres ─────────────────────────────────────────────────────────
     st.subheader("4 · Paramètres")
     if zh_presence == "Non":
         recul = st.slider(
@@ -93,9 +92,9 @@ with col_params:
     manquants = []
     if zip_file is None:           manquants.append("shapefile terrain")
     if not nom_projet.strip():     manquants.append("nom du projet")
+    if not urbanisme.strip():      manquants.append("document d'urbanisme applicable")
     if zh_presence == "Oui":
         if zh_file is None:        manquants.append("couche zones humides")
-        if elements_file is None:  manquants.append("couche éléments techniques")
 
     pret = len(manquants) == 0
     if not pret:
@@ -160,7 +159,7 @@ with col_result:
                         f.write(elements_file.read())
 
                 # ── Génération ────────────────────────────────────────────────
-                with st.spinner("Génération de la carte en cours…"):
+                with st.spinner("Génération de la carte en cours… (chargement GPU urbanisme si activé)"):
                     png_bytes = generer_carte(
                         shp_path       = shp_path,
                         nom_projet     = nom_projet.strip(),
@@ -171,6 +170,7 @@ with col_result:
                         dpi            = 150,
                         zh_path        = zh_tmp_path,
                         elements_path  = elts_tmp_path,
+
                     )
 
                 st.success("✅ Carte générée avec succès !")

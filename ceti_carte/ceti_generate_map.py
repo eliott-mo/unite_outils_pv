@@ -20,6 +20,80 @@ from pyproj import Transformer
 
 
 # ════════════════════════════════════════════════════════════════
+# COULEURS CONVENTIONNELLES PLU
+# ════════════════════════════════════════════════════════════════
+COULEURS_PLU = {
+    "U":  {"fc": "#FF6B6B", "ec": "#CC2200", "label": "Zone U — Urbaine"},
+    "AU": {"fc": "#FFB347", "ec": "#CC6600", "label": "Zone AU — À urbaniser"},
+    "A":  {"fc": "#F9E04B", "ec": "#CC9900", "label": "Zone A — Agricole"},
+    "N":  {"fc": "#74C476", "ec": "#2D7A2D", "label": "Zone N — Naturelle"},
+}
+COULEUR_PLU_DEFAUT = {"fc": "#CCCCCC", "ec": "#888888", "label": "Zone — Autre"}
+
+
+def charger_zones_urbanisme(x0, y0, x1, y1):
+    """
+    Interroge le Geoportail de l'Urbanisme (GPU) via API Carto IGN.
+    Endpoint : https://apicarto.ign.fr/api/gpu/zone-urba
+
+    Parametres : emprise en Lambert-93 (x0,y0 = coin SO, x1,y1 = coin NE)
+    Retourne
+    --------
+    GeoDataFrame (n > 0)   : zones PLU trouvees
+    GeoDataFrame vide      : API OK mais aucune zone = commune sous RNU
+    None                   : echec de l'API (reseau, timeout...)
+    """
+    import json, requests
+    from pyproj import Transformer as _Tr
+
+    tr = _Tr.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+    lon0, lat0 = tr.transform(x0, y0)
+    lon1, lat1 = tr.transform(x1, y1)
+
+    geom_bbox = {
+        "type": "Polygon",
+        "coordinates": [[[lon0, lat0], [lon1, lat0],
+                          [lon1, lat1], [lon0, lat1],
+                          [lon0, lat0]]],
+    }
+    params = {
+        "geom":   json.dumps(geom_bbox, separators=(",", ":")),
+        "_limit": 1000,
+    }
+    try:
+        r = requests.get(
+            "https://apicarto.ign.fr/api/gpu/zone-urba",
+            params=params, timeout=30,
+            headers={"Accept": "application/json"},
+        )
+        r.raise_for_status()
+        features = r.json().get("features", [])
+        if not features:
+            print("GPU : aucune zone PLU (commune sous RNU probable)")
+            # GeoDataFrame vide = signal RNU
+            return gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs="EPSG:4326"),
+                                    crs="EPSG:4326")
+        gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+        gdf = gdf.to_crs(epsg=2154)
+        print("GPU : {} zones PLU chargees".format(len(gdf)))
+        return gdf
+    except Exception as e:
+        print("GPU : echec ({}) : {}".format(type(e).__name__, str(e)[:80]))
+        return None   # None = erreur reseau
+
+
+def type_zone(libelle):
+    """Retourne la clé de couleur (U/AU/A/N) depuis le libellé de zone."""
+    if libelle is None:
+        return None
+    lib = str(libelle).upper().strip()
+    for key in ["AU", "U", "A", "N"]:   # AU avant U pour éviter les faux positifs
+        if lib.startswith(key):
+            return key
+    return None
+
+
+# ════════════════════════════════════════════════════════════════
 # PARAMETRES — lancement direct terminal uniquement
 # ════════════════════════════════════════════════════════════════
 SHP_PATH       = ""   # chemin local uniquement
@@ -44,6 +118,142 @@ def to_dms(deg, is_lat):
     deg  = abs(deg)
     d = int(deg); m = int((deg - d) * 60); s = (deg - d - m / 60) * 3600
     return "{:02d}\u00b0{:02d}'{:05.2f}'' {}".format(d, m, s, hemi)
+
+
+def calcul_extremaux(terrain, tr, echelle=5000):
+    """
+    Selectionne jusqu'a 4 points cardinaux (N/S/E/O) sur l'enveloppe convexe
+    du terrain avec deduplication maximin et offsets d'annotation radiaux.
+
+    Algorithme
+    ----------
+    1. Calculer les 4 extrema cardinaux (N=max Y, S=min Y, E=max X, O=min X).
+    2. Selectionner dans l'ordre N, S, E, O.
+       Si le candidat est a moins de MIN_DIST d'un point deja retenu,
+       le remplacer par le sommet du hull non encore selectionne qui maximise
+       la distance minimale a l'ensemble des points retenus.
+       Si aucun remplacement valide -> point omis.
+       MIN_DIST = max(5 % diagonale terrain, 1 m).
+    3. Offset radial depuis le centroide (8 octants).
+    4. Anti-chevauchement iteratif des encarts (push perpendiculaire).
+    """
+    hull_pts = np.array(terrain.convex_hull.exterior.coords[:-1])
+    n        = len(hull_pts)
+    cx, cy   = terrain.centroid.x, terrain.centroid.y
+
+    minx, miny, maxx, maxy = terrain.bounds
+    diag     = math.hypot(maxx - minx, maxy - miny)
+    MIN_DIST = max(diag * 0.05, 1.0)
+
+    def hdist(i, j):
+        return math.hypot(hull_pts[i][0] - hull_pts[j][0],
+                          hull_pts[i][1] - hull_pts[j][1])
+
+    def min_dist_to_sel(k, sel):
+        return min(hdist(k, s) for s in sel)
+
+    cardinal = [
+        ("A", int(np.argmax(hull_pts[:, 1]))),   # nord
+        ("B", int(np.argmin(hull_pts[:, 1]))),   # sud
+        ("C", int(np.argmax(hull_pts[:, 0]))),   # est
+        ("D", int(np.argmin(hull_pts[:, 0]))),   # ouest
+    ]
+
+    sel_idx = []
+    sel_lbl = []
+
+    for lbl, idx in cardinal:
+        ok = (not sel_idx) or all(hdist(idx, si) >= MIN_DIST for si in sel_idx)
+        if ok:
+            sel_idx.append(idx)
+            sel_lbl.append(lbl)
+        else:
+            # Remplacement maximin : sommet non retenu le plus eloigne des selectionnes
+            remaining = [k for k in range(n) if k not in sel_idx]
+            if remaining:
+                best = max(remaining, key=lambda k: min_dist_to_sel(k, sel_idx))
+                if min_dist_to_sel(best, sel_idx) >= MIN_DIST:
+                    sel_idx.append(best)
+                    sel_lbl.append(lbl)
+                else:
+                    print("  [extremaux] Pt {} omis (terrain trop compact)".format(lbl))
+            else:
+                print("  [extremaux] Pt {} omis (pas de sommet disponible)".format(lbl))
+
+    # \u2500\u2500 Offsets radiaux (8 octants depuis centroide) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    M_PER_PT = echelle * 0.0254 / 72
+    BOX_W    = 92
+    BOX_H    = 52
+    PUSH     = 8
+
+    result = []
+    for lbl, idx in zip(sel_lbl, sel_idx):
+        px, py = hull_pts[idx]
+        lon, lat = tr.transform(px, py)
+
+        ux = px - cx; uy = py - cy
+        norm  = max(math.hypot(ux, uy), 1e-6)
+        ux   /= norm; uy /= norm
+        angle = math.degrees(math.atan2(uy, ux))
+
+        if   -22.5 <= angle <  22.5:   adx, ady = PUSH,             -BOX_H // 2
+        elif  22.5 <= angle <  67.5:   adx, ady = PUSH,              PUSH
+        elif  67.5 <= angle < 112.5:   adx, ady = -BOX_W // 2,       PUSH
+        elif 112.5 <= angle < 157.5:   adx, ady = -(BOX_W + PUSH),   PUSH
+        elif angle >= 157.5 or angle < -157.5:
+                                       adx, ady = -(BOX_W + PUSH),  -BOX_H // 2
+        elif -157.5 <= angle < -112.5: adx, ady = -(BOX_W + PUSH), -(BOX_H + PUSH)
+        elif -112.5 <= angle <  -67.5: adx, ady = -BOX_W // 2,     -(BOX_H + PUSH)
+        else:                          adx, ady = PUSH,             -(BOX_H + PUSH)
+
+        result.append({
+            "label":  "Pt {}".format(lbl),
+            "x": px, "y": py,
+            "lat":    to_dms(lat, True),
+            "lon":    to_dms(lon, False),
+            "ann_dx": adx, "ann_dy": ady,
+            "_ux":    ux, "_uy": uy,
+        })
+
+    # \u2500\u2500 Anti-chevauchement perpendiculaire iteratif \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    GAP      = 6
+    STEP     = 10
+    MAX_ITER = 30
+    THRESH_X = (BOX_W + GAP) * M_PER_PT
+    THRESH_Y = (BOX_H + GAP) * M_PER_PT
+
+    for _ in range(MAX_ITER):
+        moved = False
+        for i in range(len(result)):
+            for j in range(i + 1, len(result)):
+                ri, rj = result[i], result[j]
+                cxi = ri["x"] + (ri["ann_dx"] + BOX_W / 2) * M_PER_PT
+                cyi = ri["y"] + (ri["ann_dy"] + BOX_H / 2) * M_PER_PT
+                cxj = rj["x"] + (rj["ann_dx"] + BOX_W / 2) * M_PER_PT
+                cyj = rj["y"] + (rj["ann_dy"] + BOX_H / 2) * M_PER_PT
+                if abs(cxi - cxj) < THRESH_X and abs(cyi - cyj) < THRESH_Y:
+                    sx = cxj - cxi; sy = cyj - cyi
+                    snorm = max(math.hypot(sx, sy), 1e-6)
+                    sx /= snorm; sy /= snorm
+                    pi_x, pi_y = -ri["_uy"],  ri["_ux"]
+                    pj_x, pj_y = -rj["_uy"],  rj["_ux"]
+                    dot_i = pi_x * sx + pi_y * sy
+                    dot_j = pj_x * sx + pj_y * sy
+                    si = -math.copysign(1.0, dot_i) if abs(dot_i) > 1e-9 else  1.0
+                    sj =  math.copysign(1.0, dot_j) if abs(dot_j) > 1e-9 else -1.0
+                    result[i]["ann_dx"] = int(ri["ann_dx"] + si * pi_x * STEP)
+                    result[i]["ann_dy"] = int(ri["ann_dy"] + si * pi_y * STEP)
+                    result[j]["ann_dx"] = int(rj["ann_dx"] + sj * pj_x * STEP)
+                    result[j]["ann_dy"] = int(rj["ann_dy"] + sj * pj_y * STEP)
+                    moved = True
+        if not moved:
+            break
+
+    for pt in result:
+        pt.pop("_ux", None)
+        pt.pop("_uy", None)
+
+    return result
 
 
 def charger_geodata(path):
@@ -133,7 +343,8 @@ def draw_hatch(ax, geom, ec="#0077BB", fc="#AEE4FF", hatch="////",
 
 def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                   echelle=5000, fond_aerien=True, dpi=150, buffer_carte=650,
-                  tick_deg=0.005, zh_path=None, elements_path=None):
+                  tick_deg=0.005, zh_path=None, elements_path=None,
+                  urba_terrain=False, urba_buffer=True):
     """
     Génère la carte de situation CETI et retourne les bytes PNG.
 
@@ -220,24 +431,15 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     ax_h_in  = geo_h / echelle / 0.0254
     fig_w_in = ax_w_in + MARGIN_L + MARGIN_R
     fig_h_in = ax_h_in + MARGIN_TOP + MARGIN_BOT
-    echelle_lbl = "1\u202f/\u202f{:,}".format(echelle).replace(",", "\u202f")
+    echelle_lbl = "1 / {:,}".format(echelle).replace(",", " ")
 
     print("Axe : {:.1f}\u00d7{:.1f} cm | Figure : {}\u00d7{} px".format(
         ax_w_in * 2.54, ax_h_in * 2.54,
         int(fig_w_in * dpi), int(fig_h_in * dpi)))
 
     # ── Points extrémaux WGS84 DMS ────────────────────────────────────────────
-    tr  = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-    pts = np.array(terrain.convex_hull.exterior.coords)
-    extremal = []
-    for lbl, fn in [("N", lambda p: np.argmax(p[:, 1])),
-                    ("S", lambda p: np.argmin(p[:, 1])),
-                    ("E", lambda p: np.argmax(p[:, 0])),
-                    ("O", lambda p: np.argmin(p[:, 0]))]:
-        x, y = pts[fn(pts)]
-        lon, lat = tr.transform(x, y)
-        extremal.append({"label": "Pt {}".format(lbl), "x": x, "y": y,
-                         "lat": to_dms(lat, True), "lon": to_dms(lon, False)})
+    tr       = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+    extremal = calcul_extremaux(terrain, tr, echelle)
 
     # ── Figure ────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=dpi)
@@ -301,6 +503,109 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
 
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1); ax.set_autoscale_on(False)
 
+    # ── Zones PLU (Géoportail de l'Urbanisme — API Carto IGN) ────────────────
+    gdf_plu     = None
+    legende_plu = {}      # clé tz -> couleur (pour légende, sans doublons)
+    rnu_detecte = False
+
+    if urba_terrain or urba_buffer:
+        if urba_buffer:
+            bx0, by0, bx1, by1 = buf600.bounds
+        else:
+            bx0, by0, bx1, by1 = terrain.bounds
+        gdf_plu = charger_zones_urbanisme(bx0, by0, bx1, by1)
+
+    if gdf_plu is not None:
+        # Geometrie de clipping selon les cases cochees
+        if urba_terrain and urba_buffer:
+            clip_geom = buf600
+        elif urba_terrain:
+            clip_geom = terrain
+        else:
+            clip_geom = buf600
+
+        if len(gdf_plu) == 0:
+            # ── Commune sous RNU : aucune zone numerisee ────────────────────
+            rnu_detecte = True
+            draw_hatch(ax, clip_geom,
+                       ec="#999999", fc="#CCCCCC", hatch="////",
+                       alpha_fill=0.20, lw=0.8, zorder=1)
+            rnu_pt = clip_geom.representative_point()
+            ax.text(rnu_pt.x, rnu_pt.y, "RNU",
+                    fontsize=13, fontweight="bold", color="#777777",
+                    ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.45", fc="white",
+                              alpha=0.88, ec="#999999", lw=1.2),
+                    zorder=20)
+
+        else:
+            # ── PLU numerise : dessiner chaque zone ─────────────────────────
+            col_type = "typezone" if "typezone" in gdf_plu.columns else None
+            col_lib  = "libelle"  if "libelle"  in gdf_plu.columns else None
+            SEUIL_LABEL_M2 = 5000   # zone < 5 000 m² = pas de label
+
+            for _, row in gdf_plu.iterrows():
+                geom = row.geometry
+                if geom is None or geom.is_empty:
+                    continue
+                try:
+                    geom = geom.intersection(clip_geom)
+                except Exception:
+                    continue
+                if geom is None or geom.is_empty:
+                    continue
+
+                # Determiner la categorie (U / AU / A / N)
+                # type_zone() normalise AUs->AU, UB->U, etc.
+                tz = None
+                if col_type:
+                    raw = str(row[col_type]).strip() if row[col_type] else ""
+                    tz = type_zone(raw)
+                if tz is None and col_lib:
+                    raw = str(row[col_lib]).strip() if row[col_lib] else ""
+                    tz = type_zone(raw)
+
+                if tz is not None:
+                    couleur = COULEURS_PLU[tz]
+                    draw_geom(ax, geom, fc=couleur["fc"], ec=couleur["ec"],
+                              lw=0.8, alpha_fill=0.30, ls="-", zorder=1)
+                    if tz not in legende_plu:
+                        legende_plu[tz] = couleur
+                else:
+                    # Zone sans categorie reconnue : bord gris, aucun remplissage
+                    draw_geom(ax, geom, fc="none", ec="#AAAAAA",
+                              lw=0.5, alpha_fill=0, ls="--", zorder=1)
+                    legende_plu["?"] = None   # signale la presence de zones inconnues
+
+                # ── Label libelle court (ex : Ns, AUx, A) ──────────────────
+                lbl_txt = ""
+                if col_lib:
+                    v = str(row[col_lib]).strip() if row[col_lib] else ""
+                    if v and v.lower() not in ("none", "nan"):
+                        lbl_txt = v
+                if not lbl_txt and col_type:
+                    v = str(row[col_type]).strip() if row[col_type] else ""
+                    if v and v.lower() not in ("none", "nan"):
+                        lbl_txt = v
+
+                if lbl_txt and geom.area >= SEUIL_LABEL_M2:
+                    try:
+                        rp = geom.representative_point()
+                        rx, ry = float(rp.x), float(rp.y)
+                    except Exception:
+                        rx = None
+                    if rx is not None and x0 <= rx <= x1 and y0 <= ry <= y1:
+                        txt_color = (COULEURS_PLU[tz]["ec"]
+                                     if tz else "#888888")
+                        ax.text(rx, ry, lbl_txt,
+                                fontsize=8, fontweight="bold",
+                                color=txt_color,
+                                ha="center", va="center",
+                                bbox=dict(boxstyle="round,pad=0.2",
+                                          fc="white", alpha=0.80, ec="none"),
+                                zorder=20, clip_on=True)
+
+
     # ── Couches de base ───────────────────────────────────────────────────────
     # Périmètre 600m — halo sombre + trait blanc pour lisibilité sur fond aérien
     draw_geom(ax, buf600, fc="none", ec="#333333", lw=3.5, alpha_fill=0, ls=(0,(4,5)), zorder=2)
@@ -342,17 +647,16 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
 
     # ── Points extrémaux ──────────────────────────────────────────────────────
     c_txt = "white" if fond_ok else "#222"
-    off = {"N": (10, 12), "S": (10, -65), "E": (10, 5), "O": (-110, 5)}
     for pt in extremal:
-        dx, dy = off.get(pt["label"][-1], (10, 10))
         ax.plot(pt["x"], pt["y"], "o", color="#990000", markersize=8,
                 zorder=9, markeredgecolor="white", markeredgewidth=1.2)
         ax.annotate("{}\n{}\n{}".format(pt["label"], pt["lat"], pt["lon"]),
                     xy=(pt["x"], pt["y"]),
-                    xytext=(dx, dy), textcoords="offset points",
+                    xytext=(pt["ann_dx"], pt["ann_dy"]),
+                    textcoords="offset points",
                     fontsize=7.5, color="#660000", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                              alpha=0.92, ec="#990000", lw=0.8), zorder=10)
+                              alpha=0.92, ec="#990000", lw=0.8), zorder=15)
 
     # ── Barre d'échelle ───────────────────────────────────────────────────────
     sb_x = x1 - geo_w * 0.04 - 500
@@ -386,7 +690,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                      markeredgecolor="#333333",
                      label="P\u00e9rim\u00e8tre de 600 m"),
         mlines.Line2D([], [], color="#990000", marker="o", linestyle="None",
-                      markersize=8, label="Points extr\u00e9maux WGS84"),
+                      markersize=8, label="Points de coordonn\u00e9es WGS84"),
     ]
 
     # Entrées légende conditionnelles ZH
@@ -401,17 +705,54 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     if gdf_elts is not None and len(gdf_elts) > 0:
         legend_items.append(
             mlines.Line2D([], [], color="#CC6600", linewidth=0.7,
-                          label="Éléments techniques centrale PV")
+                          label="\u00c9l\u00e9ments techniques centrale PV")
+        )
+    # Zones PLU — RNU en premier si détecté, puis une entrée par catégorie
+    if rnu_detecte:
+        legend_items.append(
+            mpatches.Patch(facecolor="#CCCCCC", edgecolor="#999999",
+                           alpha=0.55, linewidth=0.8, hatch="////",
+                           label="Commune sous RNU")
+        )
+    for tz, couleur in legende_plu.items():
+        if tz == "?" or couleur is None:
+            continue  # zones inconnues gérées par la note
+        lbl = COULEURS_PLU[tz]["label"] if tz in COULEURS_PLU else "Zone urbanisme"
+        legend_items.append(
+            mpatches.Patch(facecolor=couleur["fc"], edgecolor=couleur["ec"],
+                           alpha=0.4, linewidth=0.5, label=lbl)
+        )
+    # Note en bas si PLU demandé (disclaimer données GPU)
+    _NOTE = "Sans couleur = info non disponible (Géoportail de l'Urbanisme)"
+    _show_note = (urba_terrain or urba_buffer) and gdf_plu is not None
+    if _show_note:
+        legend_items.append(
+            mlines.Line2D([], [], color="none", linewidth=0, label=_NOTE)
         )
 
-    ax.legend(handles=legend_items, loc="lower left",
-              fontsize=9, framealpha=0.93, edgecolor="#cccccc")
+    leg = ax.legend(handles=legend_items, loc="lower left",
+                    fontsize=9, framealpha=0.93, edgecolor="#cccccc")
+
+    # Mise en forme de la note (italique gris, handle invisible)
+    if _show_note:
+        for txt in leg.get_texts():
+            if txt.get_text() == _NOTE:
+                txt.set_color("#888888")
+                txt.set_style("italic")
+                txt.set_fontsize(7.5)
+        try:
+            handles = leg.legend_handles
+        except AttributeError:
+            handles = leg.legendHandles
+        for handle, txt in zip(handles, leg.get_texts()):
+            if txt.get_text() == _NOTE:
+                handle.set_visible(False)
 
     # ── Encart urbanisme ──────────────────────────────────────────────────────
     if urbanisme.strip():
         ax.text(x1 - geo_w * 0.02, y1 - geo_h * 0.02,
-                "Urbanisme\n{}\n{}".format("\u2500" * 22, urbanisme),
-                ha="right", va="top", fontsize=10, linespacing=1.7,
+                "Document d'urbanisme applicable\n{}\n{}".format("\u2500" * 22, urbanisme),
+                ha="right", va="top", fontsize=10, weight="bold", linespacing=1.7,
                 bbox=dict(boxstyle="round,pad=0.6", fc="white",
                           alpha=0.93, ec="#CC0000", lw=2.5), zorder=11)
 
@@ -449,6 +790,21 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         "UNITe PV \u2014 {}\nPlan de situation  |  \u00c9chelle\u202f: {}  |  {}".format(
             nom_projet, echelle_lbl, src),
         fontsize=15, fontweight="bold", pad=16)
+
+    # ── Logo UNITe (haut-droite, meme hauteur que le titre) ───────────────────
+    _LOGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo unite.png")
+    if os.path.exists(_LOGO):
+        from PIL import Image as _PILImg
+        _logo = _PILImg.open(_LOGO).convert("RGBA")
+        _target_h = max(int(MARGIN_TOP * dpi * 0.72), 10)
+        _target_w = int(_target_h * _logo.width / _logo.height)
+        _logo = _logo.resize((_target_w, _target_h), _PILImg.LANCZOS)
+        _logo_arr = np.array(_logo)
+        _axes_top_px = int((MARGIN_BOT + ax_h_in) * dpi)
+        _yo = _axes_top_px + (int(MARGIN_TOP * dpi) - _target_h) // 2
+        _fig_w_px = int(fig_w_in * dpi)
+        _xo = _fig_w_px - _target_w - int(0.10 * dpi)
+        fig.figimage(_logo_arr, xo=_xo, yo=_yo, origin="upper")
 
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
 

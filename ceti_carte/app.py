@@ -74,7 +74,7 @@ with col_params:
     if zh_presence == "Non":
         recul = st.slider(
             "Recul zone capteurs PV (m)",
-            min_value=0, max_value=50, value=10, step=1,
+            min_value=0, max_value=100, value=10, step=1,
             help="Buffer négatif appliqué au terrain d'implantation pour délimiter la zone des capteurs PV au sens du CdC de la CRE."
         )
     else:

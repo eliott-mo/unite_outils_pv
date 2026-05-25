@@ -9,6 +9,7 @@ import os, re, zipfile, tempfile
 import streamlit as st
 from ceti_generate_map import generer_carte
 
+
 st.set_page_config(
     page_title="CETI - Générateur plan de situation",
     page_icon="🗺️",
@@ -54,8 +55,9 @@ with col_params:
         help="Si oui, la carte devra afficher les ZH et les éléments techniques du projet (requis par le CDC CRE)."
     )
 
-    zh_file       = None
-    elements_file = None
+    zh_file        = None
+    panneaux_file  = None
+    pistes_files   = []
 
     if zh_presence == "Oui":
         st.info("ℹ️ Le CDC impose d'afficher les zones humides, les panneaux, les pistes et les locaux techniques sur la carte.")
@@ -64,10 +66,16 @@ with col_params:
             type=["zip", "kml", "geojson", "json"],
             help="Fichier fourni par le BE environnemental. Formats acceptés : shapefile zippé, KML, GeoJSON."
         )
-        elements_file = st.file_uploader(
-            "Couche éléments techniques — UNIQUEMENT panneaux, pistes, locaux (.kml)",
+        panneaux_file = st.file_uploader(
+            "KML rangées de panneaux — lignes et polygones des tables solaires (.kml)",
             type=["kml"],
-            help="Fichier KML fourni par le BE technique, contenant panneaux (polygones), pistes (lignes) et locaux (points)."
+            help="Fichier KML contenant uniquement les rangées de panneaux (LineStrings courtes et/ou polygones). Obligatoire si zones humides."
+        )
+        pistes_files = st.file_uploader(
+            "KML pistes et postes — optionnel (1 ou 2 fichiers)",
+            type=["kml"],
+            accept_multiple_files=True,
+            help="Fichier(s) KML contenant les pistes d'accès (LineStrings) et postes de transformation (points). Accepte 1 ou 2 fichiers KML. Facultatif : améliore la délimitation des clusters de panneaux."
         )
 
     st.subheader("4 · Paramètres")
@@ -85,6 +93,12 @@ with col_params:
         value=True,
         help="Désactiver si la connexion est lente ou si le fond ne se charge pas correctement."
     )
+    format_export = st.radio(
+        "Format d'export",
+        options=["PDF", "PNG"],
+        horizontal=True,
+        help="PDF recommandé pour l'envoi à la DREAL."
+    )
 
     st.divider()
 
@@ -95,6 +109,7 @@ with col_params:
     if not urbanisme.strip():      manquants.append("document d'urbanisme applicable")
     if zh_presence == "Oui":
         if zh_file is None:        manquants.append("couche zones humides")
+        if panneaux_file is None:  manquants.append("KML rangées de panneaux")
 
     pret = len(manquants) == 0
     if not pret:
@@ -125,70 +140,91 @@ with col_result:
         )
 
     else:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            try:
-                # ── Extraction shapefile terrain ──────────────────────────────
-                with zipfile.ZipFile(zip_file, "r") as zf:
-                    zf.extractall(tmpdir)
+        try:
+            fmt_lower = format_export.lower()
 
-                shp_path = None
+            # ── Extraction des fichiers dans un dossier temporaire ────────────
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Terrain shapefile
+                zip_path = os.path.join(tmpdir, "terrain.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(zip_file.read())
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(tmpdir)
+                shp = None
                 for root, _, files in os.walk(tmpdir):
-                    for f in files:
-                        if f.endswith(".shp"):
-                            shp_path = os.path.join(root, f)
+                    for fn in files:
+                        if fn.endswith(".shp"):
+                            shp = os.path.join(root, fn)
                             break
-                    if shp_path:
+                    if shp:
                         break
 
-                if shp_path is None:
-                    st.error("❌ Aucun fichier .shp trouvé dans le zip.")
-                    st.stop()
-
-                # ── Sauvegarde couches optionnelles sur disque temporaire ──────
-                zh_tmp_path = None
-                if zh_file is not None:
-                    ext_zh = os.path.splitext(zh_file.name)[1]
-                    zh_tmp_path = os.path.join(tmpdir, "zh{}".format(ext_zh))
-                    with open(zh_tmp_path, "wb") as f:
+                # Couches optionnelles
+                zh_path = None
+                if zh_file:
+                    zh_ext  = os.path.splitext(zh_file.name)[1]
+                    zh_path = os.path.join(tmpdir, "zh{}".format(zh_ext))
+                    with open(zh_path, "wb") as f:
                         f.write(zh_file.read())
 
-                elts_tmp_path = None
-                if elements_file is not None:
-                    elts_tmp_path = os.path.join(tmpdir, "elements.kml")
-                    with open(elts_tmp_path, "wb") as f:
-                        f.write(elements_file.read())
+                panneaux_path = None
+                if panneaux_file:
+                    panneaux_path = os.path.join(tmpdir, "panneaux.kml")
+                    with open(panneaux_path, "wb") as f:
+                        f.write(panneaux_file.read())
 
-                # ── Génération ────────────────────────────────────────────────
-                with st.spinner("Génération de la carte en cours… (chargement GPU urbanisme si activé)"):
+                pistes_paths = None
+                if pistes_files:
+                    pistes_paths = []
+                    for i, pf in enumerate(pistes_files):
+                        p = os.path.join(tmpdir, "pistes_{}.kml".format(i))
+                        with open(p, "wb") as f:
+                            f.write(pf.read())
+                        pistes_paths.append(p)
+
+                # ── Génération — toujours en PNG (une seule passe) ────────────
+                with st.spinner("Génération de la carte en cours… (chargement fond aérien si activé)"):
                     png_bytes = generer_carte(
-                        shp_path       = shp_path,
+                        shp_path       = shp,
                         nom_projet     = nom_projet.strip(),
                         recul_capteurs = recul,
                         urbanisme      = urbanisme.strip(),
                         echelle        = 5000,
                         fond_aerien    = fond_aerien,
                         dpi            = 150,
-                        zh_path        = zh_tmp_path,
-                        elements_path  = elts_tmp_path,
-
+                        zh_path        = zh_path,
+                        kml_panneaux   = panneaux_path,
+                        kml_pistes     = pistes_paths,
+                        format         = "png",
                     )
 
-                st.success("✅ Carte générée avec succès !")
-                st.image(png_bytes, use_container_width=True)
+            st.success("✅ Carte générée avec succès !")
+            st.image(png_bytes, width='stretch')
 
-                _slug     = re.sub(r"[^\w]+", "_", nom_projet.strip()).strip("_")
-                file_name = "UNITe_CETI_PV_{}.png".format(_slug)
+            # ── Conversion PDF en mémoire si demandé (pas de 2e appel) ───────
+            _slug = re.sub(r"[^\w]+", "_", nom_projet.strip()).strip("_")
+            if fmt_lower == "pdf":
+                import io as _io
+                from PIL import Image as _PIL
+                _buf_pdf = _io.BytesIO()
+                _PIL.open(_io.BytesIO(png_bytes)).save(_buf_pdf, format="PDF", resolution=300)
+                carte_bytes = _buf_pdf.getvalue()
+                mime_type   = "application/pdf"
+            else:
+                carte_bytes = png_bytes
+                mime_type   = "image/png"
 
-                st.download_button(
-                    label            = "⬇️ Télécharger la carte (PNG)",
-                    data             = png_bytes,
-                    file_name        = file_name,
-                    mime             = "image/png",
-                    use_container_width=True,
-                )
+            st.download_button(
+                label            = "⬇️ Télécharger la carte ({})".format(format_export),
+                data             = carte_bytes,
+                file_name        = "UNITe_CETI_PV_{}.{}".format(_slug, fmt_lower),
+                mime             = mime_type,
+                use_container_width=True,
+            )
 
-            except zipfile.BadZipFile:
-                st.error("❌ Le fichier uploadé n'est pas un zip valide.")
-            except Exception as e:
-                st.error("❌ Erreur lors de la génération : {}".format(str(e)))
-                st.exception(e)
+        except zipfile.BadZipFile:
+            st.error("❌ Le fichier uploadé n'est pas un zip valide.")
+        except Exception as e:
+            st.error("❌ Erreur lors de la génération : {}".format(str(e)))
+            st.exception(e)

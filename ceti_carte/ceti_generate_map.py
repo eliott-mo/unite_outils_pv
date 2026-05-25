@@ -18,6 +18,19 @@ from matplotlib.path import Path
 from shapely.ops import unary_union
 from pyproj import Transformer
 
+# ── Cache tuiles IGN persistant entre sessions ────────────────────────────────
+# Par défaut contextily supprime le cache à la fin de chaque session Python.
+# On le redirige vers un dossier permanent pour éviter de re-télécharger
+# les mêmes tuiles à chaque génération.
+try:
+    import contextily as _ctx_init
+    _TILE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".tile_cache")
+    os.makedirs(_TILE_CACHE, exist_ok=True)
+    _ctx_init.set_cache_dir(_TILE_CACHE)
+except Exception:
+    pass  # contextily absent ou erreur non bloquante
+
 
 # ════════════════════════════════════════════════════════════════
 # COULEURS CONVENTIONNELLES PLU
@@ -344,9 +357,11 @@ def draw_hatch(ax, geom, ec="#0077BB", fc="#AEE4FF", hatch="////",
 def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                   echelle=5000, fond_aerien=True, dpi=150, buffer_carte=650,
                   tick_deg=0.005, zh_path=None, elements_path=None,
-                  urba_terrain=False, urba_buffer=True):
+                  kml_panneaux=None, kml_pistes=None,
+                  urba_terrain=False, urba_buffer=True,
+                  format="png", debug=False):
     """
-    Génère la carte de situation CETI et retourne les bytes PNG.
+    Génère la carte de situation CETI et retourne les bytes PNG ou PDF.
 
     Paramètres
     ----------
@@ -360,16 +375,29 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     buffer_carte    : rayon emprise carte en mètres (défaut 650)
     tick_deg        : intervalle ticks WGS84 en degrés (défaut 0.005)
     zh_path         : chemin couche zones humides (.zip, .kml, .geojson) — optionnel
-    elements_path   : chemin couche éléments techniques (.kml) — optionnel
+    elements_path   : chemin couche éléments techniques (.kml) — fallback si un seul KML
+    kml_panneaux    : chemin KML rangées de panneaux (LineStrings courtes + polygones)
+    kml_pistes      : chemin KML pistes/postes, ou liste de chemins (1 ou 2 fichiers) — optionnel
+    format          : "png" (défaut) ou "pdf"
 
     Retourne : bytes PNG
     """
+
+    # ── Horodatage ────────────────────────────────────────────────────────────
+    import time as _time
+    _t0 = _time.time()
+    def _ts(label):
+        if debug:
+            print("[{:6.1f}s] {}".format(_time.time() - _t0, label))
+
+    _ts("DEBUT generer_carte")
 
     # ── Géométries terrain ────────────────────────────────────────────────────
     gdf      = gpd.read_file(shp_path)
     terrain  = unary_union(gdf.geometry)
     capteurs = terrain.buffer(-recul_capteurs)
     buf600   = terrain.buffer(600)
+    _ts("Shapefile + buffers terrain")
 
     minx, miny, maxx, maxy = terrain.bounds
     pad = buffer_carte
@@ -378,38 +406,111 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     geo_w, geo_h = x1 - x0, y1 - y0
 
     # ── Chargement couches optionnelles ───────────────────────────────────────
-    gdf_zh  = charger_geodata(zh_path)       if zh_path       else None
-    gdf_elts = charger_geodata(elements_path) if elements_path else None
+    from shapely.ops import polygonize as _polygonize
 
-    # Séparer les éléments techniques par type de géométrie
-    elts_poly       = None  # panneaux (polygones si dispo)
-    elts_lines      = None  # pistes et autres lignes
-    elts_pts        = None  # locaux techniques (points)
-    capteurs_depuis_kml = None  # zone capteurs reconstruite depuis les lignes du KML
+    gdf_zh = charger_geodata(zh_path) if zh_path else None
+    _ts("Chargement ZH")
 
-    if gdf_elts is not None and len(gdf_elts) > 0:
-        from shapely.ops import polygonize as _polygonize
-        mask_poly  = gdf_elts.geometry.geom_type.isin(["Polygon","MultiPolygon"])
-        mask_lines = gdf_elts.geometry.geom_type.isin(["LineString","MultiLineString"])
-        mask_pts   = gdf_elts.geometry.geom_type.isin(["Point","MultiPoint"])
+    # Résolution des sources KML éléments techniques :
+    # Priorité : kml_panneaux / kml_pistes (mode deux KML)
+    # Fallback : elements_path (mode ancien, un seul KML)
+    gdf_panneaux = charger_geodata(kml_panneaux) if kml_panneaux else None
 
-        if mask_poly.any():
-            elts_poly = unary_union(gdf_elts[mask_poly].geometry)
+    # kml_pistes accepte un chemin unique (str) ou une liste de chemins
+    if kml_pistes:
+        import pandas as _pd_p
+        _paths_pistes = [kml_pistes] if isinstance(kml_pistes, str) else list(kml_pistes)
+        _gdfs_pistes  = [charger_geodata(p) for p in _paths_pistes if p]
+        _gdfs_pistes  = [g for g in _gdfs_pistes if g is not None and len(g) > 0]
+        gdf_pistes = _pd_p.concat(_gdfs_pistes, ignore_index=True) if _gdfs_pistes else None
+    else:
+        gdf_pistes = None
 
-        if mask_lines.any():
-            all_lines = unary_union(gdf_elts[mask_lines].geometry)
-            elts_lines = all_lines
-            # Reconstruction de la zone capteurs par polygonize des lignes
-            polys_from_lines = list(_polygonize(all_lines))
-            if polys_from_lines:
-                # Buffer +5m / -5m pour fusionner les rangées proches en zones
-                capteurs_depuis_kml = unary_union(polys_from_lines).buffer(5).buffer(-5)
-                print("Zone capteurs reconstruite depuis KML : {:.2f} ha".format(
-                    capteurs_depuis_kml.area / 10000))
+    _ts("Chargement KML panneaux + pistes")
+    # Mode un seul KML (fallback) : on l'utilise comme gdf_panneaux
+    if gdf_panneaux is None and elements_path:
+        gdf_panneaux = charger_geodata(elements_path)
 
-        if mask_pts.any():
-            elts_pts = unary_union(gdf_elts[mask_pts].geometry)
+    # gdf_elts = union pour compatibilité avec le bloc d'affichage existant
+    if gdf_panneaux is not None and gdf_pistes is not None:
+        import pandas as _pd
+        gdf_elts = _pd.concat([gdf_panneaux, gdf_pistes], ignore_index=True)
+    elif gdf_panneaux is not None:
+        gdf_elts = gdf_panneaux
+    elif gdf_pistes is not None:
+        gdf_elts = gdf_pistes
+    else:
+        gdf_elts = None
 
+    # ── Construction zone capteurs depuis KML panneaux ────────────────────────
+    capteurs_depuis_kml = None   # MultiPolygon ou None (par cluster)
+    capteurs_clusters   = []     # liste de Polygon/MultiPolygon individuels
+
+    if gdf_panneaux is not None and len(gdf_panneaux) > 0:
+        mask_poly_p  = gdf_panneaux.geometry.geom_type.isin(["Polygon","MultiPolygon"])
+        mask_lines_p = gdf_panneaux.geometry.geom_type.isin(["LineString","MultiLineString"])
+
+        # Approche rapide : buffer directement sur l'union des lignes
+        # Évite le polygonize (21 000 petits polys → unary_union lent)
+        # Buffer +5m fusionne les rangées proches → union → buffer -5m sépare les clusters
+        BUF_CLOSE = 5
+
+        _geoms_panneaux = []
+        if mask_lines_p.any():
+            _geoms_panneaux.append(unary_union(gdf_panneaux[mask_lines_p].geometry))
+        if mask_poly_p.any():
+            _geoms_panneaux.append(unary_union(gdf_panneaux[mask_poly_p].geometry))
+
+        if _geoms_panneaux:
+            _ts("Closing debut")
+            _base = unary_union(_geoms_panneaux)
+            zones_merged = _base.buffer(BUF_CLOSE).buffer(-BUF_CLOSE)
+            _ts("Closing termine")
+            n_zones = len(list(zones_merged.geoms)) if hasattr(zones_merged, "geoms") else (0 if zones_merged.is_empty else 1)
+            print("Closing +{}/-{}m : {} zones, {:.2f} ha".format(BUF_CLOSE, BUF_CLOSE, n_zones, zones_merged.area/10000))
+
+        if _geoms_panneaux:
+            n_zones = (len(list(zones_merged.geoms))
+                       if hasattr(zones_merged, "geoms")
+                       else (0 if zones_merged.is_empty else 1))
+            print("Closing +{}/-{}m : {} zones, {:.2f} ha".format(
+                BUF_CLOSE, BUF_CLOSE, n_zones, zones_merged.area / 10000))
+
+            # 4. Soustraction corridors pistes (3m) si KML pistes fourni
+            if gdf_pistes is not None and len(gdf_pistes) > 0:
+                mask_lines_r = gdf_pistes.geometry.geom_type.isin(
+                    ["LineString", "MultiLineString"])
+                if mask_lines_r.any():
+                    pistes_buf = unary_union(
+                        gdf_pistes[mask_lines_r].geometry).buffer(3)
+                    zones_merged = zones_merged.difference(pistes_buf)
+                    n_ap = (len(list(zones_merged.geoms))
+                            if hasattr(zones_merged, "geoms")
+                            else (0 if zones_merged.is_empty else 1))
+                    print("Soustraction corridors pistes (3m) -> {} clusters".format(n_ap))
+
+            # 5. Éclater en clusters individuels, buffer +3m pour zone capteurs
+            if hasattr(zones_merged, "geoms"):
+                raw_clusters = [g for g in zones_merged.geoms if not g.is_empty]
+            else:
+                raw_clusters = [zones_merged] if not zones_merged.is_empty else []
+
+            capteurs_clusters = [c.buffer(5) for c in raw_clusters]
+            if capteurs_clusters:
+                capteurs_depuis_kml = unary_union(capteurs_clusters)
+                print("Zone capteurs : {} cluster(s), {:.2f} ha total".format(
+                    len(capteurs_clusters), capteurs_depuis_kml.area / 10000))
+        else:
+            print("Avertissement : KML panneaux sans géométries utilisables")
+
+    elif gdf_elts is not None and len(gdf_elts) > 0:
+        # Ancien fallback : buffer 5m autour de tous les éléments
+        capteurs_depuis_kml = unary_union(gdf_elts.geometry).buffer(5)
+        capteurs_clusters   = [capteurs_depuis_kml]
+        print("Zone capteurs (fallback buffer) : {:.2f} ha".format(
+            capteurs_depuis_kml.area / 10000))
+
+    _ts("Zone capteurs terminee")
     # ZH : on decoupe a l emprise du terrain d implantation
     # (la couche ZH peut etre tres etendue)
     if gdf_zh is not None:
@@ -422,6 +523,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
             print("ZH decoupee au terrain : {:.2f} ha".format(zh_geom.area / 10000))
     else:
         zh_geom = None
+    _ts("Intersection ZH terminee")
 
     # ── Taille figure à l'échelle exacte ──────────────────────────────────────
     MARGIN_L, MARGIN_R     = 0.90, 0.15
@@ -441,6 +543,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     tr       = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
     extremal = calcul_extremaux(terrain, tr, echelle)
 
+    _ts("Figure matplotlib creee (avant fond IGN)")
     # ── Figure ────────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=dpi)
     ax  = fig.add_axes([
@@ -462,6 +565,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         "&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&FORMAT=image/jpeg"
     )
     if fond_aerien:
+        _ts("IGN fetch debut (contextily bounds2img)")
         try:
             import contextily as ctx
             from rasterio.transform import from_bounds as _rio_bounds
@@ -472,8 +576,12 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
             _to3857 = Transformer.from_crs("EPSG:2154", "EPSG:3857", always_xy=True)
             _bx0, _by0 = _to3857.transform(x0, y0)
             _bx1, _by1 = _to3857.transform(x1, y1)
+
+            # n_connections=4 : téléchargement parallèle des tuiles (~3× plus rapide)
             _img_wm, _ext = ctx.bounds2img(_bx0, _by0, _bx1, _by1,
-                                            zoom="auto", source=ign_url, ll=False)
+                                            zoom="auto", source=ign_url, ll=False,
+                                            n_connections=4)
+            _ts("IGN tuiles telechargees ({} x {} px)".format(_img_wm.shape[1], _img_wm.shape[0]))
             _H, _W, _nb = _img_wm.shape
             _src_crs = _CRS.from_epsg(3857)
             _dst_crs = _CRS.from_epsg(2154)
@@ -493,9 +601,10 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
             ax.imshow(_img_l93, extent=[_el, _er, _eb, _et],
                       zorder=0, alpha=0.85, aspect="auto")
             fond_ok = True
-            print("\u2705 Fond IGN charg\u00e9")
+            _ts("IGN reprojete et affiche")
+            print("OK Fond IGN charge")
         except Exception as e:
-            print("\u26a0\ufe0f  Fond IGN indisponible ({}) \u2014 fond neutre".format(type(e).__name__))
+            print("WARN Fond IGN indisponible ({}) - fond neutre".format(type(e).__name__))
 
     if not fond_ok:
         ax.set_facecolor("#f0ede8")
@@ -513,7 +622,9 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
             bx0, by0, bx1, by1 = buf600.bounds
         else:
             bx0, by0, bx1, by1 = terrain.bounds
+        _ts("GPU/PLU fetch debut")
         gdf_plu = charger_zones_urbanisme(bx0, by0, bx1, by1)
+        _ts("GPU/PLU fetch termine ({} zones)".format(len(gdf_plu) if gdf_plu is not None else 0))
 
     # Déterminer la géométrie de clipping une seule fois
     if urba_terrain or urba_buffer:
@@ -656,20 +767,26 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                             zorder=20)
         except Exception as e:
             print("Calcul zone RNU échoué : {}".format(e))
+        _ts("PLU rendu + calcul RNU termine")
 
         # ── Couches de base ───────────────────────────────────────────────────────
     # Périmètre 600m — halo sombre + trait blanc pour lisibilité sur fond aérien
     draw_geom(ax, buf600, fc="none", ec="#333333", lw=3.5, alpha_fill=0, ls=(0,(4,5)), zorder=2)
     draw_geom(ax, buf600, fc="none", ec="#FFFFFF", lw=1.8, alpha_fill=0, ls=(0,(4,5)), zorder=2)
     draw_geom(ax, terrain,  fc="none",    ec="#CC0000", lw=2.5, alpha_fill=0,    ls="-",       zorder=10)
-    # Zone capteurs : buffer 10m autour des éléments techniques si fournis,
-    # sinon buffer négatif standard sur le terrain
-    if gdf_elts is not None and len(gdf_elts) > 0:
-        zone_capteurs = unary_union(gdf_elts.geometry).buffer(5)
+
+    # ── Zone capteurs : tirets-points bleu roi, 1 tracé par cluster
+    _ZC_LS = (0, (6, 2, 1, 2))
+    if capteurs_clusters:
+        for cluster in capteurs_clusters:
+            if cluster is None or cluster.is_empty:
+                continue
+            draw_geom(ax, cluster, fc="none", ec="#000000", lw=2.8, alpha_fill=0, ls=_ZC_LS, zorder=5)
+            draw_geom(ax, cluster, fc="none", ec="#1A6FBF", lw=1.5, alpha_fill=0, ls=_ZC_LS, zorder=5)
     else:
-        zone_capteurs = capteurs
-    draw_geom(ax, zone_capteurs, fc="none", ec="#d94701",
-              lw=1.2, alpha_fill=0, ls=(0,(4,3)), zorder=8)
+        # Aucun KML : zone capteurs standard (buffer négatif terrain)
+        draw_geom(ax, capteurs, fc="none", ec="#000000", lw=2.8, alpha_fill=0, ls=_ZC_LS, zorder=5)
+        draw_geom(ax, capteurs, fc="none", ec="#1A6FBF", lw=1.5, alpha_fill=0, ls=_ZC_LS, zorder=5)
 
     # ── Zones humides (si présentes) ──────────────────────────────────────────
     if zh_geom is not None:
@@ -681,21 +798,32 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                    lw=0.8,
                    zorder=2)
 
-    # ── Éléments techniques (si présents) — formes du KML ────────────────────
-    # Éléments techniques centrale PV — couche unique toutes géométries confondues
+    # ── Éléments techniques (si présents) — formes des KML ───────────────────
+    # Rendu unifié orange : panneaux (lignes+polys) + pistes (lignes+points)
     if gdf_elts is not None and len(gdf_elts) > 0:
+        # Simplification vectorisée avant la boucle (plus rapide que par géométrie)
+        # 1 m sans perte visuelle à 1/5000 (1 m = 0.2 mm sur la carte)
+        gdf_elts = gdf_elts.copy()
+        gdf_elts["geometry"] = gdf_elts.geometry.simplify(1.0, preserve_topology=True)
         for geom in gdf_elts.geometry:
             if geom is None or geom.is_empty:
                 continue
             gtype = geom.geom_type
             if gtype in ("Polygon", "MultiPolygon"):
-                draw_geom(ax, geom, fc="#E8A020", ec="#B87000",
+                draw_geom(ax, geom, fc="#E8A020", ec="#d94701",
                           lw=0.7, alpha_fill=0.35, ls="-", zorder=7)
             elif gtype in ("LineString", "MultiLineString"):
-                draw_geom(ax, geom, fc="none", ec="#CC6600",
-                          lw=0.7, alpha_fill=0, ls="-", zorder=7)
-            # Points ignorés (locaux techniques non différenciables dans le KML)
+                draw_geom(ax, geom, fc="none", ec="#d94701",
+                          lw=0.8, alpha_fill=0, ls="-", zorder=7)
+            elif gtype in ("Point", "MultiPoint"):
+                pts_list = [geom] if gtype == "Point" else list(geom.geoms)
+                for pt in pts_list:
+                    # coords[0] peut être (x, y) ou (x, y, z) — on prend juste x,y
+                    c = pt.coords[0]
+                    ax.plot(c[0], c[1], "s", color="#d94701", markersize=5,
+                            zorder=7, markeredgecolor="#B85000", markeredgewidth=0.5)
 
+    _ts("Tracé géométries (terrain/capteurs/ZH/elts) termine")
     # ── Points extrémaux ──────────────────────────────────────────────────────
     c_txt = "white" if fond_ok else "#222"
     for pt in extremal:
@@ -733,12 +861,11 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                      label="Terrain d'implantation"),
     ]
     legend_items.append(
-        mlines.Line2D([], [], color="#d94701", linewidth=2, linestyle=(0,(6,4)),
+        mlines.Line2D([], [], color="#1A6FBF", linewidth=1.5, linestyle=(0,(6,2,1,2)),
                       label="Zone d'implantation des capteurs")
     )
     legend_items += [
-        mlines.Line2D([], [], color="#FFFFFF", linewidth=1.8, linestyle=(0,(4,5)),
-                     markeredgecolor="#333333",
+        mlines.Line2D([], [], color="#AAAAAA", linewidth=2.0, linestyle=(0,(4,5)),
                      label="P\u00e9rim\u00e8tre de 600 m"),
         mlines.Line2D([], [], color="#990000", marker="o", linestyle="None",
                       markersize=8, label="Points de coordonn\u00e9es WGS84"),
@@ -755,7 +882,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     # Entrées légende conditionnelles éléments techniques
     if gdf_elts is not None and len(gdf_elts) > 0:
         legend_items.append(
-            mlines.Line2D([], [], color="#CC6600", linewidth=0.7,
+            mlines.Line2D([], [], color="#d94701", linewidth=1.0,
                           label="\u00c9l\u00e9ments techniques centrale PV")
         )
     # Zones PLU — RNU en premier si détecté, puis une entrée par catégorie
@@ -858,12 +985,27 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         fig.figimage(_logo_arr, xo=_xo, yo=_yo, origin="upper")
 
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+    _ts("Annotations/legende/titre terminees")
 
     # ── Export bytes ──────────────────────────────────────────────────────────
+    fmt = format.lower().strip()
+    if fmt not in ("png", "pdf"):
+        raise ValueError("format doit etre 'png' ou 'pdf', recu : {!r}".format(fmt))
     buf = io.BytesIO()
-    plt.savefig(buf, dpi=dpi, facecolor="white", format="png")
-    plt.close()
+    _ts("savefig debut ({}, dpi={})".format(fmt, dpi if fmt == "png" else 300))
+    if fmt == "pdf":
+        # PNG 300 dpi → conversion PIL→PDF : ~3× plus rapide que savefig vectoriel
+        from PIL import Image as _PIL
+        _buf_png = io.BytesIO()
+        plt.savefig(_buf_png, dpi=300, facecolor="white", format="png")
+        plt.close()
+        _buf_png.seek(0)
+        _PIL.open(_buf_png).save(buf, format="PDF", resolution=300)
+    else:
+        plt.savefig(buf, dpi=dpi, facecolor="white", format="png")
+        plt.close()
     buf.seek(0)
+    _ts("savefig termine")
 
     print("Surface : {:.2f} ha  |  \u00c9chelle : {}".format(
         terrain.area / 10000, echelle_lbl))

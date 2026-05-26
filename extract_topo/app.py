@@ -405,8 +405,6 @@ def _ajouter_tooltip_hover(
   var ROWS = {rows_js};
   var COLS = {cols_js};
 
-  // La variable JS de la carte Folium ({map_var}) est créée APRÈS ce script.
-  // On boucle toutes les 100 ms jusqu'à ce qu'elle soit disponible.
   function init() {{
     if (typeof {map_var} === 'undefined') {{ setTimeout(init, 100); return; }}
     var mapObj = {map_var};
@@ -422,7 +420,7 @@ def _ajouter_tooltip_hover(
       var pente = PENTES[row][col];
       var orient = ORIENTATIONS[row][col];
       if (pente !== null) {{
-        el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
+        el.innerHTML = 'Pente : <b>' + pente + ' %</b> &mdash; Orientation : <b>' + orient + '</b>';
         el.style.display = 'block';
       }} else {{
         el.style.display = 'none';
@@ -438,6 +436,13 @@ def _ajouter_tooltip_hover(
   init();
 }})();
 </script>"""
+    carte.get_root().html.add_child(folium.Element(html))
+
+
+# ── 8. Export TXT PVCase ──────────────────────────────────────────────────────
+
+def exporter_txt(mnt: np.ndarray, transform_l93) -> bytes:
+    """
     Format PVCase Ground Mount :
         _MULTIPLE _POINT
         X,Y,Z  (Lambert 93, virgule, 2 décimales)
@@ -580,7 +585,7 @@ with col_result:
         st.markdown(
             """
             <div style='text-align:center; padding: 80px 40px; color: #999;'>
-                <div style='font-size:60px'>🗺️</div>
+                <div style='font-size:60px'>&#128506;</div>
                 <p style='margin-top:16px; font-size:15px; line-height:1.8'>
                 Renseignez les paramètres à gauche<br>
                 et cliquez sur <strong>Lancer l'extraction</strong>.

@@ -392,11 +392,13 @@ def _ajouter_tooltip_hover(
     map_var = carte.get_name()
 
     html = f"""<div id="hover-info" style="
-  position:fixed;bottom:24px;right:12px;z-index:1000;
+  position:fixed;top:0;left:0;z-index:1000;
   background:rgba(0,0,0,0.65);color:white;
   padding:6px 12px;border-radius:4px;
   font-size:13px;font-family:monospace;
-  pointer-events:none;display:none;"></div>
+  pointer-events:none;display:none;
+  transform:translate(14px,-50%);
+  white-space:nowrap;"></div>
 <script>
 (function() {{
   var PENTES = {_pentes_to_js(pentes_js)};
@@ -409,28 +411,32 @@ def _ajouter_tooltip_hover(
     if (typeof {map_var} === 'undefined') {{ setTimeout(init, 100); return; }}
     var mapObj = {map_var};
 
-    mapObj.on('mousemove', function(e) {{
-      var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
-      var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
-      var el = document.getElementById('hover-info');
-      if (!el) return;
-      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
-        el.style.display = 'none'; return;
-      }}
-      var pente = PENTES[row][col];
-      var orient = ORIENTATIONS[row][col];
-      if (pente !== null) {{
-        el.innerHTML = 'Pente : <b>' + pente + ' %</b> &mdash; Orientation : <b>' + orient + '</b>';
-        el.style.display = 'block';
-      }} else {{
-        el.style.display = 'none';
-      }}
-    }});
+  mapObj.on('mousemove', function(e) {{
+    var pt = e.containerPoint;
+    var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
+    var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
+    var el = document.getElementById('hover-info');
+    if (!el) return;
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
+      el.style.display = 'none';
+      return;
+    }}
+    var pente = PENTES[row][col];
+    var orient = ORIENTATIONS[row][col];
+    if (pente !== null) {{
+      el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
+      el.style.top  = pt.y + 'px';
+      el.style.left = pt.x + 'px';
+      el.style.display = 'block';
+    }} else {{
+      el.style.display = 'none';
+    }}
+  }});
 
-    mapObj.on('mouseout', function() {{
-      var el = document.getElementById('hover-info');
-      if (el) el.style.display = 'none';
-    }});
+  mapObj.on('mouseout', function() {{
+    var el = document.getElementById('hover-info');
+    if (el) el.style.display = 'none';
+  }});
   }}
 
   init();

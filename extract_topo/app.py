@@ -399,45 +399,45 @@ def _ajouter_tooltip_hover(
   pointer-events:none;display:none;"></div>
 <script>
 (function() {{
-  var mapObj = {map_var};
   var PENTES = {_pentes_to_js(pentes_js)};
   var ORIENTATIONS = {_orientations_to_js(orientations_js)};
   var BOUNDS = {{north:{lat_n:.8f},south:{lat_s:.8f},east:{lon_e:.8f},west:{lon_w:.8f}}};
   var ROWS = {rows_js};
   var COLS = {cols_js};
 
-  mapObj.on('mousemove', function(e) {{
-    var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
-    var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
-    var el = document.getElementById('hover-info');
-    if (!el) return;
-    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
-      el.style.display = 'none';
-      return;
-    }}
-    var pente = PENTES[row][col];
-    var orient = ORIENTATIONS[row][col];
-    if (pente !== null) {{
-      el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
-      el.style.display = 'block';
-    }} else {{
-      el.style.display = 'none';
-    }}
-  }});
+  // La variable JS de la carte Folium ({map_var}) est créée APRÈS ce script.
+  // On boucle toutes les 100 ms jusqu'à ce qu'elle soit disponible.
+  function init() {{
+    if (typeof {map_var} === 'undefined') {{ setTimeout(init, 100); return; }}
+    var mapObj = {map_var};
 
-  mapObj.on('mouseout', function() {{
-    var el = document.getElementById('hover-info');
-    if (el) el.style.display = 'none';
-  }});
+    mapObj.on('mousemove', function(e) {{
+      var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
+      var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
+      var el = document.getElementById('hover-info');
+      if (!el) return;
+      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
+        el.style.display = 'none'; return;
+      }}
+      var pente = PENTES[row][col];
+      var orient = ORIENTATIONS[row][col];
+      if (pente !== null) {{
+        el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
+        el.style.display = 'block';
+      }} else {{
+        el.style.display = 'none';
+      }}
+    }});
+
+    mapObj.on('mouseout', function() {{
+      var el = document.getElementById('hover-info');
+      if (el) el.style.display = 'none';
+    }});
+  }}
+
+  init();
 }})();
 </script>"""
-    carte.get_root().html.add_child(folium.Element(html))
-
-
-# ── 8. Export TXT PVCase ──────────────────────────────────────────────────────
-
-def exporter_txt(mnt: np.ndarray, transform_l93) -> bytes:
-    """
     Format PVCase Ground Mount :
         _MULTIPLE _POINT
         X,Y,Z  (Lambert 93, virgule, 2 décimales)

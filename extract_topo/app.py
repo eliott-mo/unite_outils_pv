@@ -155,7 +155,28 @@ def fetch_mnt(bbox_l93: tuple, resolution: int) -> tuple:
     return z_all.reshape(rows, cols), transform
 
 
-# ── 4. Calcul des pentes et orientations (algorithme Horn) ───────────────────
+# ── 4. Détection résolution réelle (1m natif vs 5m rééchantillonné) ──────────
+
+def detecter_resolution_reelle(mnt: np.ndarray) -> bool:
+    """
+    Retourne True si les données sont du vrai 1 m, False si interpolé depuis 5 m.
+
+    Signal : quand l'API IGN renvoie du 5 m rééchantillonné en nearest-neighbour,
+    ~75 % des transitions entre pixels consécutifs sont nulles (blocs de 5 pixels
+    identiques). Sur de vraies données 1 m, ce taux est proche de 0 %.
+
+    Teste sur la ligne centrale du raster pour éviter les bords NaN.
+    Seuil calibré empiriquement sur test Guadeloupe (hors couverture 1 m).
+    """
+    ligne = mnt[mnt.shape[0] // 2, :]
+    ligne = ligne[~np.isnan(ligne)]
+    if len(ligne) < 20:
+        return True  # pas assez de points → confiance par défaut
+    taux_repetition = np.sum(np.diff(ligne) == 0) / (len(ligne) - 1)
+    return taux_repetition < 0.60  # seuil : 60 % → interpolé si ≥ 60 %
+
+
+# ── 5. Calcul des pentes et orientations (algorithme Horn) ───────────────────
 
 def calculer_pentes_et_orientation(mnt: np.ndarray, transform) -> tuple:
     """
@@ -381,13 +402,18 @@ def _ajouter_tooltip_hover(
     orientations_js = orientations[::factor, ::factor]
     rows_js, cols_js = pentes_js.shape
 
-    # Bounds WGS84 du raster L93 (conversion pyproj — approximation linéaire suffisante)
-    _tr = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
-    x_min, y_max_l93 = transform_l93.c, transform_l93.f
+    # Bounds WGS84 exactes via rasterio.warp.transform_bounds
+    # (densify_pts=21 tient compte de la courbure L93→WGS84 sur les bords
+    #  → corrige le décalage est/ouest du tooltip vs l'ImageOverlay)
+    x_min = transform_l93.c
+    y_max_l93 = transform_l93.f
     x_max = x_min + w * transform_l93.a
     y_min = y_max_l93 + h * transform_l93.e  # transform.e < 0
-    lon_w, lat_s = _tr.transform(x_min, y_min)
-    lon_e, lat_n = _tr.transform(x_max, y_max_l93)
+    lon_w, lat_s, lon_e, lat_n = rasterio.warp.transform_bounds(
+        "EPSG:2154", "EPSG:4326",
+        x_min, y_min, x_max, y_max_l93,
+        densify_pts=21,
+    )
 
     map_var = carte.get_name()
 
@@ -407,36 +433,36 @@ def _ajouter_tooltip_hover(
   var ROWS = {rows_js};
   var COLS = {cols_js};
 
+  // {map_var} est cree APRES ce script — on attend qu'il soit disponible.
   function init() {{
     if (typeof {map_var} === 'undefined') {{ setTimeout(init, 100); return; }}
     var mapObj = {map_var};
 
-  mapObj.on('mousemove', function(e) {{
-    var pt = e.containerPoint;
-    var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
-    var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
-    var el = document.getElementById('hover-info');
-    if (!el) return;
-    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
-      el.style.display = 'none';
-      return;
-    }}
-    var pente = PENTES[row][col];
-    var orient = ORIENTATIONS[row][col];
-    if (pente !== null) {{
-      el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
-      el.style.top  = pt.y + 'px';
-      el.style.left = pt.x + 'px';
-      el.style.display = 'block';
-    }} else {{
-      el.style.display = 'none';
-    }}
-  }});
+    mapObj.on('mousemove', function(e) {{
+      var pt = e.containerPoint;
+      var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
+      var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
+      var el = document.getElementById('hover-info');
+      if (!el) return;
+      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
+        el.style.display = 'none'; return;
+      }}
+      var pente = PENTES[row][col];
+      var orient = ORIENTATIONS[row][col];
+      if (pente !== null) {{
+        el.style.top  = pt.y + 'px';
+        el.style.left = pt.x + 'px';
+        el.innerHTML = 'Pente : <b>' + pente + ' %</b> &mdash; Orientation : <b>' + orient + '</b>';
+        el.style.display = 'block';
+      }} else {{
+        el.style.display = 'none';
+      }}
+    }});
 
-  mapObj.on('mouseout', function() {{
-    var el = document.getElementById('hover-info');
-    if (el) el.style.display = 'none';
-  }});
+    mapObj.on('mouseout', function() {{
+      var el = document.getElementById('hover-info');
+      if (el) el.style.display = 'none';
+    }});
   }}
 
   init();
@@ -447,22 +473,26 @@ def _ajouter_tooltip_hover(
 
 # ── 8. Export TXT PVCase ──────────────────────────────────────────────────────
 
-def exporter_txt(mnt: np.ndarray, transform_l93) -> bytes:
+def exporter_txt(mnt: np.ndarray, transform_l93, pas: int = 1) -> bytes:
     """
-    Format PVCase Ground Mount :
-        _MULTIPLE _POINT
-        X,Y,Z  (Lambert 93, virgule, 2 décimales)
-    Couvre tous les pixels valides du MNT (zone + buffer).
+    Format PVCase Ground Mount : _MULTIPLE _POINT + X,Y,Z (L93, virgule, 2 déc.)
+
+    pas=1 : tous les pixels — résolution native
+    pas>1 : un pixel sur pas×pas — sous-échantillonnage
+            (ex. pas=5 pour obtenir un export 5 m depuis un raster 1 m)
+    Les coordonnées X,Y sont calculées dans le repère du raster original.
     """
-    rows, cols = mnt.shape
+    mnt_exp = mnt[::pas, ::pas]
+    rows, cols = mnt_exp.shape
+
     col_idx = np.tile(np.arange(cols), rows)
     row_idx = np.repeat(np.arange(rows), cols)
-
-    z_flat = mnt.ravel()
+    z_flat = mnt_exp.ravel()
     valid = ~np.isnan(z_flat)
 
-    x = transform_l93.c + (col_idx[valid] + 0.5) * transform_l93.a
-    y = transform_l93.f + (row_idx[valid] + 0.5) * transform_l93.e
+    # Indices originaux (avant sous-échantillonnage) pour coordonnées exactes
+    x = transform_l93.c + (col_idx[valid] * pas + 0.5) * transform_l93.a
+    y = transform_l93.f + (row_idx[valid] * pas + 0.5) * transform_l93.e
     z = z_flat[valid]
 
     if len(z) == 0:
@@ -489,7 +519,11 @@ st.divider()
 
 # ── Session state ─────────────────────────────────────────────────────────────
 # Résultats affichage
-for _k in ("carte_html", "txt_bytes", "nom_fichier"):
+for _k in (
+    "carte_html", "txt_bytes", "nom_fichier",
+    "txt_bytes_interp", "nom_fichier_interp",
+    "resolution_effective", "warning_resolution",
+):
     if _k not in st.session_state:
         st.session_state[_k] = None
 
@@ -619,6 +653,25 @@ with col_result:
             # Téléchargement MNT (barre de progression intégrée dans fetch_mnt)
             mnt, transform = fetch_mnt(bbox_l93, _res)
 
+            # Détection 1m réel vs 5m rééchantillonné par l'API IGN
+            resolution_effective = _res
+            if _res == 1:
+                if not detecter_resolution_reelle(mnt):
+                    resolution_effective = 5
+                    st.session_state.warning_resolution = (
+                        "Données 1 m non disponibles sur cette zone — "
+                        "l'API IGN a retourné du 5 m rééchantillonné (nearest-neighbour). "
+                        "La carte affichée correspond à une interpolation de ces données "
+                        "à la granularité 1 m. "
+                        "Deux exports disponibles ci-dessous : fichier 5 m non interpolé "
+                        "et fichier 1 m interpolé."
+                    )
+                else:
+                    st.session_state.warning_resolution = None
+            else:
+                st.session_state.warning_resolution = None
+            st.session_state.resolution_effective = resolution_effective
+
             with st.spinner("Calcul des pentes et orientations…"):
                 # Lissage gaussien pour l'affichage carte (sigma=5 px) si résolution 1m
                 # L'export TXT utilise le MNT brut non lissé
@@ -638,8 +691,20 @@ with col_result:
                 st.session_state.carte_html = carte.get_root().render()
 
             with st.spinner("Préparation de l'export TXT…"):
-                st.session_state.txt_bytes = exporter_txt(mnt, transform)
-                st.session_state.nom_fichier = f"{nom_shp}_{_res}m.txt"
+                if _res == 1 and resolution_effective == 5:
+                    # Cas interpolé : deux exports distincts
+                    # — 5m non interpolé : un point tous les 5 pixels du raster 1m
+                    st.session_state.txt_bytes = exporter_txt(mnt, transform, pas=5)
+                    st.session_state.nom_fichier = f"{nom_shp}_5m.txt"
+                    # — 1m interpolé : grille complète telle que retournée par l'API
+                    st.session_state.txt_bytes_interp = exporter_txt(mnt, transform, pas=1)
+                    st.session_state.nom_fichier_interp = f"{nom_shp}_1m_interpole.txt"
+                else:
+                    # Cas normal : un seul export à la résolution effective
+                    st.session_state.txt_bytes = exporter_txt(mnt, transform, pas=1)
+                    st.session_state.nom_fichier = f"{nom_shp}_{resolution_effective}m.txt"
+                    st.session_state.txt_bytes_interp = None
+                    st.session_state.nom_fichier_interp = None
 
             st.session_state.extracting = False
             st.rerun()  # rerun final pour déverrouiller les widgets
@@ -650,14 +715,45 @@ with col_result:
 
     else:
         # ── Résultats : téléchargement en priorité, carte en dessous ──
-        st.success("✅ Extraction terminée !")
-        st.download_button(
-            label=f"⬇️ Télécharger le fichier TXT PVCase ({st.session_state.nom_fichier})",
-            data=st.session_state.txt_bytes,
-            file_name=st.session_state.nom_fichier,
-            mime="text/plain",
-            use_container_width=True,
-            type="primary",
-        )
+        if st.session_state.warning_resolution:
+            st.warning(st.session_state.warning_resolution)
+
+        res_eff = st.session_state.resolution_effective or st.session_state._resolution
+        req_res = st.session_state._resolution
+        if req_res == 1 and res_eff == 5:
+            st.success("✅ Extraction terminée — résolution effective : 5 m (données 1 m indisponibles sur cette zone)")
+        else:
+            st.success(f"✅ Extraction terminée — résolution effective : {res_eff} m")
+
+        if st.session_state.txt_bytes_interp:
+            # Cas interpolé : deux boutons côte à côte
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    label=f"⬇️ {st.session_state.nom_fichier} — 5 m non interpolé",
+                    data=st.session_state.txt_bytes,
+                    file_name=st.session_state.nom_fichier,
+                    mime="text/plain",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with col_dl2:
+                st.download_button(
+                    label=f"⬇️ {st.session_state.nom_fichier_interp} — 1 m interpolé (nearest-neighbour)",
+                    data=st.session_state.txt_bytes_interp,
+                    file_name=st.session_state.nom_fichier_interp,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+        else:
+            # Cas normal : un seul bouton
+            st.download_button(
+                label=f"⬇️ Télécharger le fichier TXT PVCase ({st.session_state.nom_fichier})",
+                data=st.session_state.txt_bytes,
+                file_name=st.session_state.nom_fichier,
+                mime="text/plain",
+                use_container_width=True,
+                type="primary",
+            )
         if st.session_state.carte_html:
             st.components.v1.html(st.session_state.carte_html, height=580, scrolling=False)

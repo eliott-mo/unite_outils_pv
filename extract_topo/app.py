@@ -18,6 +18,7 @@ from PIL import Image
 from pyproj import Transformer
 from rasterio.transform import from_bounds as rt_from_bounds
 from rasterio.crs import CRS
+from rasterio.features import rasterize as rio_rasterize
 import rasterio.warp
 from scipy.ndimage import gaussian_filter
 from streamlit_folium import st_folium
@@ -418,54 +419,43 @@ def _ajouter_tooltip_hover(
     map_var = carte.get_name()
 
     html = f"""<div id="hover-info" style="
-  position:fixed;top:0;left:0;z-index:1000;
+  position:fixed;bottom:24px;right:12px;z-index:1000;
   background:rgba(0,0,0,0.65);color:white;
   padding:6px 12px;border-radius:4px;
   font-size:13px;font-family:monospace;
-  pointer-events:none;display:none;
-  transform:translate(14px,-50%);
-  white-space:nowrap;"></div>
+  pointer-events:none;display:none;"></div>
 <script>
 (function() {{
+  var mapObj = {map_var};
   var PENTES = {_pentes_to_js(pentes_js)};
   var ORIENTATIONS = {_orientations_to_js(orientations_js)};
   var BOUNDS = {{north:{lat_n:.8f},south:{lat_s:.8f},east:{lon_e:.8f},west:{lon_w:.8f}}};
   var ROWS = {rows_js};
   var COLS = {cols_js};
 
-  // {map_var} est cree APRES ce script — on attend qu'il soit disponible.
-  function init() {{
-    if (typeof {map_var} === 'undefined') {{ setTimeout(init, 100); return; }}
-    var mapObj = {map_var};
+  mapObj.on('mousemove', function(e) {{
+    var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
+    var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
+    var el = document.getElementById('hover-info');
+    if (!el) return;
+    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
+      el.style.display = 'none';
+      return;
+    }}
+    var pente = PENTES[row][col];
+    var orient = ORIENTATIONS[row][col];
+    if (pente !== null) {{
+      el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
+      el.style.display = 'block';
+    }} else {{
+      el.style.display = 'none';
+    }}
+  }});
 
-    mapObj.on('mousemove', function(e) {{
-      var pt = e.containerPoint;
-      var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
-      var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
-      var el = document.getElementById('hover-info');
-      if (!el) return;
-      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
-        el.style.display = 'none'; return;
-      }}
-      var pente = PENTES[row][col];
-      var orient = ORIENTATIONS[row][col];
-      if (pente !== null) {{
-        el.style.top  = pt.y + 'px';
-        el.style.left = pt.x + 'px';
-        el.innerHTML = 'Pente : <b>' + pente + ' %</b> &mdash; Orientation : <b>' + orient + '</b>';
-        el.style.display = 'block';
-      }} else {{
-        el.style.display = 'none';
-      }}
-    }});
-
-    mapObj.on('mouseout', function() {{
-      var el = document.getElementById('hover-info');
-      if (el) el.style.display = 'none';
-    }});
-  }}
-
-  init();
+  mapObj.on('mouseout', function() {{
+    var el = document.getElementById('hover-info');
+    if (el) el.style.display = 'none';
+  }});
 }})();
 </script>"""
     carte.get_root().html.add_child(folium.Element(html))
@@ -571,8 +561,8 @@ with col_params:
     st.subheader("3 · Buffer")
     buffer_m = st.select_slider(
         "Emprise autour de la zone d'implantation",
-        options=list(range(0, 301, 50)),
-        value=100,
+        options=list(range(0, 31, 5)),
+        value=10,
         format_func=lambda x: f"{x} m",
         disabled=locked,
         help="Zone étendue autour du shapefile couverte par le MNT et visible sur la carte.",
@@ -625,7 +615,7 @@ with col_result:
         st.markdown(
             """
             <div style='text-align:center; padding: 80px 40px; color: #999;'>
-                <div style='font-size:60px'>&#128506;</div>
+                <div style='font-size:60px'>🗺️</div>
                 <p style='margin-top:16px; font-size:15px; line-height:1.8'>
                 Renseignez les paramètres à gauche<br>
                 et cliquez sur <strong>Lancer l'extraction</strong>.
@@ -652,6 +642,23 @@ with col_result:
 
             # Téléchargement MNT (barre de progression intégrée dans fetch_mnt)
             mnt, transform = fetch_mnt(bbox_l93, _res)
+
+            # Masquage du MNT par le polygone bufférisé (forme réelle, pas rectangle)
+            # Les pixels hors de la zone + buffer passent à NaN :
+            #   → transparents sur la carte
+            #   → exclus de l'export TXT
+            with st.spinner("Application du masque de zone…"):
+                gdf_l93 = gdf.to_crs("EPSG:2154")
+                geom_buffered = gdf_l93.union_all().buffer(_buf if _buf > 0 else 0)
+                masque = rio_rasterize(
+                    [(geom_buffered.__geo_interface__, 1)],
+                    out_shape=mnt.shape,
+                    transform=transform,
+                    fill=0,
+                    dtype=np.uint8,
+                )
+                mnt = mnt.astype(np.float32)
+                mnt[masque == 0] = np.nan
 
             # Détection 1m réel vs 5m rééchantillonné par l'API IGN
             resolution_effective = _res

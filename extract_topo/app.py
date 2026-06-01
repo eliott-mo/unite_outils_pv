@@ -1104,7 +1104,7 @@ with onglet_b:
         "Ce volet traite les fichiers de courbes de niveau Z issus de relevés drone (GeoJSON ou Shapefile). "
         "Les courbes (LineString 3D) sont interpolées par triangulation linéaire sur une grille régulière L93. "
         "Le résultat est exporté au format PVCase Ground Mount (_MULTIPLE _POINT, X,Y,Z en L93).\n\n"
-        "ATTENTION - Pente correcte mais problème identifié au niveau de l'altimétrie des données drones. A corriger dans une version ultérieure.
+        "ATTENTION - Pente correcte mais problème identifié au niveau de l'altimétrie des données drones. A corriger dans une version ultérieure."
     )
 
     b_locked = st.session_state.b_extracting

@@ -1100,7 +1100,7 @@ with onglet_a:
 with onglet_b:
 
     st.info(
-        "**Conversion courbes de niveau drone → MNT + export TXT PVCase **icon="🚁\n\n"
+        "**Conversion courbes de niveau drone → MNT + export TXT PVCase**\n\n"
         "Ce volet traite les fichiers de courbes de niveau Z issus de relevés drone (GeoJSON ou Shapefile). "
         "Les courbes (LineString 3D) sont interpolées par triangulation linéaire sur une grille régulière L93. "
         "Le résultat est exporté au format PVCase Ground Mount (_MULTIPLE _POINT, X,Y,Z en L93).\n\n"

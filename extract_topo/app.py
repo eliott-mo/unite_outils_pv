@@ -1,4 +1,4 @@
-"""Extraction Topo RGE ALTI IGN — export TXT PVCase Ground Mount."""
+"""Données Topo ESQ/APS — Extraction RGE ALTI IGN + Conversion données drone UNITe."""
 
 import io
 import os
@@ -20,7 +20,10 @@ from rasterio.transform import from_bounds as rt_from_bounds
 from rasterio.crs import CRS
 from rasterio.features import rasterize as rio_rasterize
 import rasterio.warp
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.interpolate import griddata as scipy_griddata
+from shapely.geometry import MultiPoint
+from skimage import measure as skimage_measure
 from streamlit_folium import st_folium
 
 # ── Constantes ────────────────────────────────────────────────────────────────
@@ -213,7 +216,7 @@ def calculer_pentes_et_orientation(mnt: np.ndarray, transform) -> tuple:
     return pente.astype(np.float32), orientations
 
 
-# ── 5. Classification et rendu RGBA ──────────────────────────────────────────
+# ── 5b. Classification et rendu RGBA ─────────────────────────────────────────
 
 def _classifier(pente: np.ndarray) -> np.ndarray:
     cls = np.zeros_like(pente, dtype=np.uint8)
@@ -260,10 +263,11 @@ def _rgba_l93_to_wgs84(rgba: np.ndarray, transform_l93) -> tuple:
             resampling=rasterio.warp.Resampling.nearest,
         )
 
-    lon_min = t_dst.c
-    lat_max = t_dst.f
-    lon_max = lon_min + w_dst * t_dst.a
-    lat_min = lat_max + h_dst * t_dst.e
+    # warp_transform_bounds donne les bounds WGS84 exactes de la reprojection
+    # (tient compte de la courbure L93→WGS84 — évite le décalage est/ouest)
+    lon_min, lat_min, lon_max, lat_max = rasterio.warp.transform_bounds(
+        src_crs, dst_crs, x_min, y_min, x_max, y_max, densify_pts=21
+    )
     return dst, [[lat_min, lon_min], [lat_max, lon_max]]
 
 
@@ -276,12 +280,19 @@ def _img_b64(rgba: np.ndarray) -> str:
 
 # ── 6. Génération carte Folium ────────────────────────────────────────────────
 
-def creer_carte(pentes: np.ndarray, orientations: np.ndarray, transform_l93, gdf_site: gpd.GeoDataFrame) -> folium.Map:
+def creer_carte(
+    pentes: np.ndarray,
+    orientations: np.ndarray,
+    transform_l93,
+    gdf_site: gpd.GeoDataFrame,
+    mnt_brut: np.ndarray = None,
+) -> folium.Map:
     """
     Carte Folium avec :
     - Fond satellite ESRI (défaut)
     - Overlay couleur de pentes (zone + buffer)
-    - Contour jaune pointillé du shapefile original (sans buffer)
+    - Courbes de niveau calculées depuis mnt_brut (si fourni)
+    - Contour jaune pointillé du site (toggleable)
     - Légende fixe des classes
     """
     gdf_wgs84 = gdf_site.to_crs("EPSG:4326")
@@ -316,8 +327,39 @@ def creer_carte(pentes: np.ndarray, orientations: np.ndarray, transform_l93, gdf
     ).add_to(fg)
     fg.add_to(carte)
 
-    # Contour du shapefile initial — jaune pointillé (hors LayerControl : toujours visible)
-    fg_site = folium.FeatureGroup(name="Contour du site", control=False, show=True)
+    # Courbes de niveau (calculées depuis le MNT brut si fourni)
+    if mnt_brut is not None:
+        courbes, labels_courbes = generer_courbes_niveau(mnt_brut, transform_l93)
+        if courbes:
+            fg_courbes = folium.FeatureGroup(name="Courbes de niveau", show=True)
+            folium.GeoJson(
+                {"type": "FeatureCollection", "features": courbes},
+                style_function=lambda _: {
+                    "color": "#000000",
+                    "weight": 0.8,
+                    "opacity": 0.5,
+                },
+            ).add_to(fg_courbes)
+            for lbl in labels_courbes:
+                folium.Marker(
+                    location=[lbl["lat"], lbl["lon"]],
+                    icon=folium.DivIcon(
+                        html=(
+                            f'<div style="'
+                            f'font-size:9px;font-weight:bold;color:#111;'
+                            f'text-shadow:1px 1px 0 white,-1px -1px 0 white,'
+                            f'1px -1px 0 white,-1px 1px 0 white;'
+                            f'white-space:nowrap;pointer-events:none;'
+                            f'">{int(lbl["niveau"])}</div>'
+                        ),
+                        icon_size=(28, 12),
+                        icon_anchor=(14, 6),
+                    ),
+                ).add_to(fg_courbes)
+            fg_courbes.add_to(carte)
+
+    # Contour du shapefile initial — jaune pointillé (toggleable via LayerControl)
+    fg_site = folium.FeatureGroup(name="Contour du site", control=True, show=True)
     folium.GeoJson(
         gdf_wgs84.__geo_interface__,
         style_function=lambda _: {
@@ -419,43 +461,54 @@ def _ajouter_tooltip_hover(
     map_var = carte.get_name()
 
     html = f"""<div id="hover-info" style="
-  position:fixed;bottom:24px;right:12px;z-index:1000;
+  position:fixed;top:0;left:0;z-index:1000;
   background:rgba(0,0,0,0.65);color:white;
   padding:6px 12px;border-radius:4px;
   font-size:13px;font-family:monospace;
-  pointer-events:none;display:none;"></div>
+  pointer-events:none;display:none;
+  transform:translate(14px,-50%);
+  white-space:nowrap;"></div>
 <script>
 (function() {{
-  var mapObj = {map_var};
   var PENTES = {_pentes_to_js(pentes_js)};
   var ORIENTATIONS = {_orientations_to_js(orientations_js)};
   var BOUNDS = {{north:{lat_n:.8f},south:{lat_s:.8f},east:{lon_e:.8f},west:{lon_w:.8f}}};
   var ROWS = {rows_js};
   var COLS = {cols_js};
 
-  mapObj.on('mousemove', function(e) {{
-    var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
-    var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
-    var el = document.getElementById('hover-info');
-    if (!el) return;
-    if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
-      el.style.display = 'none';
-      return;
-    }}
-    var pente = PENTES[row][col];
-    var orient = ORIENTATIONS[row][col];
-    if (pente !== null) {{
-      el.innerHTML = 'Pente : <b>' + pente + ' %</b> — Orientation : <b>' + orient + '</b>';
-      el.style.display = 'block';
-    }} else {{
-      el.style.display = 'none';
-    }}
-  }});
+  // {map_var} est cree APRES ce script — on attend qu'il soit disponible.
+  function init() {{
+    if (typeof {map_var} === 'undefined') {{ setTimeout(init, 100); return; }}
+    var mapObj = {map_var};
 
-  mapObj.on('mouseout', function() {{
-    var el = document.getElementById('hover-info');
-    if (el) el.style.display = 'none';
-  }});
+    mapObj.on('mousemove', function(e) {{
+      var pt = e.containerPoint;
+      var row = Math.floor((BOUNDS.north - e.latlng.lat) / (BOUNDS.north - BOUNDS.south) * ROWS);
+      var col = Math.floor((e.latlng.lng - BOUNDS.west) / (BOUNDS.east - BOUNDS.west) * COLS);
+      var el = document.getElementById('hover-info');
+      if (!el) return;
+      if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{
+        el.style.display = 'none'; return;
+      }}
+      var pente = PENTES[row][col];
+      var orient = ORIENTATIONS[row][col];
+      if (pente !== null) {{
+        el.style.top  = pt.y + 'px';
+        el.style.left = pt.x + 'px';
+        el.innerHTML = 'Pente : <b>' + pente + ' %</b> &mdash; Orientation : <b>' + orient + '</b>';
+        el.style.display = 'block';
+      }} else {{
+        el.style.display = 'none';
+      }}
+    }});
+
+    mapObj.on('mouseout', function() {{
+      var el = document.getElementById('hover-info');
+      if (el) el.style.display = 'none';
+    }});
+  }}
+
+  init();
 }})();
 </script>"""
     carte.get_root().html.add_child(folium.Element(html))
@@ -495,272 +548,816 @@ def exporter_txt(mnt: np.ndarray, transform_l93, pas: int = 1) -> bytes:
     return buf.getvalue()
 
 
+# ── 9. Courbes de niveau (skimage) ───────────────────────────────────────────
+
+def generer_courbes_niveau(mnt: np.ndarray, transform_l93) -> list:
+    """
+    Retourne une liste de features GeoJSON (LineString WGS84) représentant
+    les courbes de niveau du MNT.
+
+    Intervalle automatique : ~20 courbes sur la plage d'altitude.
+    Si > 5 000 contours bruts, sous-échantillonne les coordonnées (1 sur 3)
+    avant la conversion WGS84 pour limiter la taille du GeoJSON.
+    """
+    z_min = np.nanmin(mnt)
+    z_max = np.nanmax(mnt)
+    if np.isnan(z_min) or z_max - z_min < 1:
+        return []
+
+    # Intervalle arrondi au mètre le plus proche, ~20 courbes sur la plage
+    intervalle = max(1, round((z_max - z_min) / 20))
+    niveaux = np.arange(
+        np.ceil(z_min / intervalle) * intervalle,
+        z_max,
+        intervalle,
+    )
+
+    # Niveaux à labelliser : 1 sur 5 si intervalle fin (≤ 2 m), tous sinon
+    pas_label = 5 if intervalle <= 2 else 1
+    niveaux_labellises = {float(n) for i, n in enumerate(niveaux) if i % pas_label == 0}
+
+    # Première passe : collecte des contours en coordonnées pixel (row, col)
+    raw_contours = []
+    for niveau in niveaux:
+        for contour in skimage_measure.find_contours(mnt, level=float(niveau)):
+            if len(contour) >= 2:
+                raw_contours.append((float(niveau), contour))
+
+    if not raw_contours:
+        return []
+
+    # Sous-échantillonnage si trop de contours (avant conversion WGS84)
+    step = 3 if len(raw_contours) > 5000 else 1
+
+    transformer = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+    features = []
+    labels = []  # {"lat": ..., "lon": ..., "niveau": ...} pour les DivIcon
+    for niveau, contour in raw_contours:
+        coords_c = contour[::step]
+        if len(coords_c) < 2:
+            continue
+        # Lissage gaussien sur les coordonnées pixel avant conversion L93
+        # sigma=2 : bon compromis angularité / fidélité topographique
+        rows_c = gaussian_filter1d(coords_c[:, 0], sigma=2)
+        cols_c = gaussian_filter1d(coords_c[:, 1], sigma=2)
+        x_l93 = transform_l93.c + cols_c * transform_l93.a
+        y_l93 = transform_l93.f + rows_c * transform_l93.e
+        lons, lats = transformer.transform(x_l93, y_l93)
+        coords = list(zip(lons.tolist(), lats.tolist()))
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": coords},
+            "properties": {"niveau": niveau},
+        })
+        # Label au point médian — seulement courbes assez longues + niveaux principaux
+        if len(coords) >= 20 and niveau in niveaux_labellises:
+            lon_mid, lat_mid = coords[len(coords) // 2]
+            labels.append({"lat": lat_mid, "lon": lon_mid, "niveau": niveau})
+
+    return features, labels
+
+
+# ── B1. Chargement courbes de niveau drone ────────────────────────────────────
+
+def charger_courbes(raw_bytes: bytes, ext: str) -> gpd.GeoDataFrame:
+    """
+    Charge un fichier de courbes de niveau (LineString Z) depuis des bytes bruts.
+
+    Formats supportés :
+      - zip    : doit contenir un GeoJSON (.geojson / .json) ou un Shapefile (.shp)
+      - geojson / json : GeoJSON direct
+
+    Reprojette en Lambert 93 (EPSG:2154).
+    Vérifie la présence de coordonnées Z sur la première géométrie non nulle.
+    """
+    ext = ext.lower().lstrip(".")
+
+    if ext == "zip":
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+            geojson_files = [
+                n for n in zf.namelist()
+                if n.lower().endswith((".geojson", ".json"))
+            ]
+            shp_files = [n for n in zf.namelist() if n.lower().endswith(".shp")]
+            if not geojson_files and not shp_files:
+                raise ValueError("Le ZIP ne contient ni .shp ni .geojson.")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zf.extractall(tmpdir)
+                if shp_files:
+                    gdf = gpd.read_file(os.path.join(tmpdir, shp_files[0]))
+                else:
+                    gdf = gpd.read_file(os.path.join(tmpdir, geojson_files[0]))
+    elif ext in ("geojson", "json"):
+        gdf = gpd.read_file(io.BytesIO(raw_bytes))
+    else:
+        raise ValueError(f"Format non supporté : .{ext}")
+
+    # Détection CRS robuste :
+    # certains GeoJSON portent le CRS en entête mais geopandas/fiona l'ignore
+    # dans les versions anciennes. Si les coordonnées ressemblent à de l'UTM
+    # (X > 1000, Y > 1000), on force EPSG:32631 (UTM 31N — CRS drone UNITe).
+    if gdf.crs is None:
+        sample_geom = next((g for g in gdf.geometry if g is not None), None)
+        if sample_geom is not None:
+            coords = list(sample_geom.coords)
+            if coords:
+                x0, y0 = coords[0][0], coords[0][1]
+                if abs(x0) > 1000 or abs(y0) > 1000:
+                    # Coordonnées métriques détectées → UTM 31N
+                    st.warning(
+                        "CRS absent du fichier — EPSG:32631 (WGS84 / UTM zone 31N) "
+                        "supposé d'après la plage des coordonnées."
+                    )
+                    gdf = gdf.set_crs("EPSG:32631")
+                else:
+                    gdf = gdf.set_crs("EPSG:4326")
+            else:
+                gdf = gdf.set_crs("EPSG:4326")
+        else:
+            gdf = gdf.set_crs("EPSG:4326")
+
+    if gdf.empty:
+        raise ValueError("Le fichier de courbes est vide.")
+
+    # Vérification Z sur la première géométrie non nulle
+    sample = next((g for g in gdf.geometry if g is not None), None)
+    if sample is None:
+        raise ValueError("Toutes les géométries sont nulles.")
+    if not sample.has_z:
+        raise ValueError(
+            "Les géométries ne contiennent pas de coordonnée Z. "
+            "Le fichier doit provenir d'un relevé drone avec altitudes "
+            "(courbes de niveau 3D)."
+        )
+
+    # Reprojection en Lambert 93
+    gdf = gdf.to_crs("EPSG:2154")
+    return gdf
+
+
+# ── B2. Extraction des sommets XYZ ───────────────────────────────────────────
+
+def extraire_points_xyz(gdf: gpd.GeoDataFrame) -> np.ndarray:
+    """
+    Extrait tous les sommets (X, Y, Z) des géométries LineString Z.
+    Retourne un tableau NumPy (N, 3) en coordonnées L93.
+    Les types Point, Polygon, etc. sont ignorés.
+    """
+    points = []
+    for geom in gdf.geometry:
+        if geom is None:
+            continue
+        if geom.geom_type == "LineString":
+            for coord in geom.coords:
+                if len(coord) >= 3:
+                    points.append(coord[:3])
+        elif geom.geom_type == "MultiLineString":
+            for line in geom.geoms:
+                for coord in line.coords:
+                    if len(coord) >= 3:
+                        points.append(coord[:3])
+
+    if not points:
+        raise ValueError(
+            "Aucun sommet Z extrait. Vérifiez que le fichier contient "
+            "des LineString ou MultiLineString avec coordonnées Z."
+        )
+
+    return np.array(points, dtype=np.float64)
+
+
+# ── B3. Interpolation MNT (scipy griddata linéaire) ──────────────────────────
+
+def interpoler_mnt(points_xyz: np.ndarray, resolution: float) -> tuple:
+    """
+    Interpole un MNT régulier (grille L93) depuis un nuage de points XYZ.
+
+    Utilise scipy.interpolate.griddata avec méthode 'linear'.
+    Les points hors de l'enveloppe convexe des données sources resteront NaN.
+    Retourne (mnt float32, transform_l93 Affine).
+    """
+    x, y, z = points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2]
+
+    xmin, xmax = float(x.min()), float(x.max())
+    ymin, ymax = float(y.min()), float(y.max())
+
+    cols = max(2, int((xmax - xmin) / resolution))
+    rows = max(2, int((ymax - ymin) / resolution))
+
+    # Sécurité : limiter à 2000×2000
+    max_dim = 2000
+    if cols > max_dim or rows > max_dim:
+        facteur = max(cols, rows) / max_dim
+        resolution = resolution * facteur
+        cols = max(2, int((xmax - xmin) / resolution))
+        rows = max(2, int((ymax - ymin) / resolution))
+        st.warning(
+            f"Zone trop grande — résolution ajustée à {resolution:.2f} m "
+            f"({rows}×{cols} = {rows * cols:,} points)."
+        )
+
+    transform = rt_from_bounds(xmin, ymin, xmax, ymax, cols, rows)
+
+    # Grille de destination (centres de pixels, L93)
+    col_idx = np.tile(np.arange(cols), rows)
+    row_idx = np.repeat(np.arange(rows), cols)
+    x_grid = transform.c + (col_idx + 0.5) * transform.a
+    y_grid = transform.f + (row_idx + 0.5) * transform.e  # transform.e < 0
+
+    # Interpolation linéaire (Delaunay + interpolation barycentrique)
+    z_interp = scipy_griddata(
+        np.column_stack([x, y]),
+        z,
+        np.column_stack([x_grid, y_grid]),
+        method="linear",
+    )
+
+    mnt = z_interp.reshape(rows, cols).astype(np.float32)
+    return mnt, transform
+
+
 # ── Interface Streamlit ───────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Extraction Topo RGE ALTI IGN",
-    page_icon="⛰️",
+    page_title="Données Topo ESQ/APS",
+    page_icon="🗺️",
     layout="wide",
 )
 
-st.title("⛰️ Extraction Topo RGE ALTI IGN")
-st.caption("MNT RGE ALTI IGN · Export TXT PVCase Ground Mount · UNITe")
+st.title("🗺️ Données Topo ESQ/APS")
+st.caption(
+    "MNT RGE ALTI IGN (phase ESQ) · "
+    "Conversion données drone UNITe (phase APS) · "
+    "Export TXT PVCase Ground Mount"
+)
 st.divider()
 
-# ── Session state ─────────────────────────────────────────────────────────────
-# Résultats affichage
+# ── Session state — volet A ───────────────────────────────────────────────────
 for _k in (
-    "carte_html", "txt_bytes", "nom_fichier",
-    "txt_bytes_interp", "nom_fichier_interp",
-    "resolution_effective", "warning_resolution",
+    "a_carte_html", "a_txt_bytes", "a_nom_fichier", "a_intervalle_courbes",
+    "a_txt_bytes_interp", "a_nom_fichier_interp",
+    "a_resolution_effective", "a_warning_resolution",
 ):
     if _k not in st.session_state:
         st.session_state[_k] = None
 
-# État de l'extraction
-if "extracting" not in st.session_state:
-    st.session_state.extracting = False
+if "a_extracting" not in st.session_state:
+    st.session_state.a_extracting = False
 
-# Paramètres sauvegardés pour survivre au st.rerun() de verrouillage
-for _k in ("_uploaded_bytes", "_uploaded_name", "_resolution", "_buffer_m"):
+for _k in ("a__uploaded_bytes", "a__uploaded_name", "a__resolution", "a__buffer_m"):
     if _k not in st.session_state:
         st.session_state[_k] = None
 
-# Raccourci : True pendant tout le calcul → désactive les widgets
-locked = st.session_state.extracting
+# ── Session state — volet B ───────────────────────────────────────────────────
+for _k in ("b_carte_html", "b_txt_bytes", "b_nom_fichier", "b_n_points", "b_shape", "b_intervalle_courbes"):
+    if _k not in st.session_state:
+        st.session_state[_k] = None
 
-col_params, col_result = st.columns([1, 2], gap="large")
+if "b_extracting" not in st.session_state:
+    st.session_state.b_extracting = False
 
-# ── Colonne gauche : saisie des paramètres ────────────────────────────────────
-with col_params:
+for _k in (
+    "b__uploaded_bytes", "b__uploaded_name", "b__resolution_drone",
+    "b__zone_bytes", "b__zone_name", "b__buffer_m",
+):
+    if _k not in st.session_state:
+        st.session_state[_k] = None
 
-    # ── 1. Shapefile ──────────────────────────────────────────────────────────
-    st.subheader("1 · Shapefile")
-    uploaded = st.file_uploader(
-        "Déposer le fichier .zip contenant le shapefile de la zone d'implantation",
-        type=["zip"],
-        disabled=locked,
-        help="Le zip doit contenir les fichiers .shp, .dbf et .shx de la zone de projet.",
-    )
+# ── Onglets ───────────────────────────────────────────────────────────────────
+onglet_a, onglet_b = st.tabs([
+    "A · Phase ESQ — Extraction RGE ALTI IGN",
+    "B · Phase APS — Conversion données drone UNITe",
+])
 
-    # ── 2. Résolution ─────────────────────────────────────────────────────────
-    st.subheader("2 · Résolution")
-    resolution = st.radio(
-        "Résolution du MNT",
-        options=[5, 1],
-        format_func=lambda x: (
-            "5 m — rapide, recommandé pré-design"
-            if x == 5 else
-            "1 m — précis, ~30–60 s pour 10 ha"
-        ),
-        disabled=locked,
-        help="La résolution 5 m est suffisante pour le pré-design. Passer à 1 m pour une analyse fine en phase APS/APD.",
-    )
 
-    # ── 3. Buffer ─────────────────────────────────────────────────────────────
-    st.subheader("3 · Buffer")
-    buffer_m = st.select_slider(
-        "Emprise autour de la zone d'implantation",
-        options=list(range(0, 31, 5)),
-        value=10,
-        format_func=lambda x: f"{x} m",
-        disabled=locked,
-        help="Zone étendue autour du shapefile couverte par le MNT et visible sur la carte.",
-    )
+# ══════════════════════════════════════════════════════════════════════════════
+#  VOLET A — Extraction RGE ALTI IGN
+# ══════════════════════════════════════════════════════════════════════════════
 
-    st.divider()
+with onglet_a:
 
-    # ── Validation ────────────────────────────────────────────────────────────
-    manquants = []
-    if uploaded is None:
-        manquants.append("shapefile ZIP")
+    # Raccourci : True pendant tout le calcul → désactive les widgets
+    a_locked = st.session_state.a_extracting
 
-    pret = len(manquants) == 0
-    if not pret and not locked:
-        st.info("En attente : {}".format(", ".join(manquants)))
-    if locked:
-        st.info("⏳ Extraction en cours — paramètres verrouillés.")
+    col_a_params, col_a_result = st.columns([1, 2], gap="large")
 
-    lancer = st.button(
-        "🔍 Lancer l'extraction",
-        disabled=not pret or locked,
-        use_container_width=True,
-        type="primary",
-    )
+    # ── Colonne gauche : saisie des paramètres ────────────────────────────────
+    with col_a_params:
 
-    st.caption(
-        "⚠️ MNT RGE ALTI IGN — sol nu, végétation et bâtiments non modélisés. "
-        "Précision adaptée au pré-design. Relevé terrain recommandé en phase APD."
-    )
-
-# ── Déclenchement : double-run pour verrouiller avant de calculer ─────────────
-# Run 1 (clic bouton) : on sauvegarde les paramètres et on bascule extracting=True,
-#   puis st.rerun() → les widgets s'affichent disabled sur le run suivant.
-# Run 2 (extraction) : extracting=True, lancer=False → le calcul s'exécute.
-if lancer and uploaded is not None:
-    st.session_state._uploaded_bytes = uploaded.read()   # lire avant le rerun
-    st.session_state._uploaded_name = uploaded.name
-    st.session_state._resolution = resolution
-    st.session_state._buffer_m = buffer_m
-    st.session_state.extracting = True
-    st.session_state.carte_html = None
-    st.session_state.txt_bytes = None
-    st.rerun()
-
-# ── Colonne droite : rendu (calcul + résultats) ───────────────────────────────
-with col_result:
-
-    if not st.session_state.extracting and st.session_state.txt_bytes is None:
-        # ── État initial : placeholder centré ──
-        st.markdown(
-            """
-            <div style='text-align:center; padding: 80px 40px; color: #999;'>
-                <div style='font-size:60px'>🗺️</div>
-                <p style='margin-top:16px; font-size:15px; line-height:1.8'>
-                Renseignez les paramètres à gauche<br>
-                et cliquez sur <strong>Lancer l'extraction</strong>.
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        # ── 1. Shapefile ──────────────────────────────────────────────────────
+        st.subheader("1 · Shapefile")
+        a_uploaded = st.file_uploader(
+            "Déposer le fichier .zip contenant le shapefile de la zone d'implantation",
+            type=["zip"],
+            disabled=a_locked,
+            key="a_uploader",
+            help="Le zip doit contenir les fichiers .shp, .dbf et .shx de la zone de projet.",
         )
 
-    elif st.session_state.extracting:
-        # ── Traitement ──
-        _res = st.session_state._resolution
-        _buf = st.session_state._buffer_m
+        # ── 2. Résolution ─────────────────────────────────────────────────────
+        st.subheader("2 · Résolution")
+        a_resolution = st.radio(
+            "Résolution du MNT",
+            options=[5, 1],
+            format_func=lambda x: (
+                "5 m — rapide, recommandé pré-design"
+                if x == 5 else
+                "1 m — précis, ~30–60 s pour 10 ha"
+            ),
+            disabled=a_locked,
+            key="a_resolution_radio",
+            help="La résolution 5 m est suffisante pour le pré-design. Passer à 1 m pour une analyse fine en phase APS/APD.",
+        )
 
-        try:
-            with st.spinner("Chargement du shapefile…"):
-                # On passe un BytesIO car l'UploadedFile d'origine n'existe plus
-                # après le st.rerun() de verrouillage
-                gdf = load_shapefile_from_zip(io.BytesIO(st.session_state._uploaded_bytes))
-                nom_shp = os.path.splitext(st.session_state._uploaded_name)[0]
+        # ── 3. Buffer ─────────────────────────────────────────────────────────
+        st.subheader("3 · Buffer")
+        a_buffer_m = st.select_slider(
+            "Emprise autour de la zone d'implantation",
+            options=list(range(0, 31, 5)),
+            value=10,
+            format_func=lambda x: f"{x} m",
+            disabled=a_locked,
+            key="a_buffer_slider",
+            help="Zone étendue autour du shapefile couverte par le MNT et visible sur la carte.",
+        )
 
-            with st.spinner("Calcul de l'emprise…"):
-                bbox_l93 = calculer_bbox_l93(gdf, _buf)
+        st.divider()
 
-            # Téléchargement MNT (barre de progression intégrée dans fetch_mnt)
-            mnt, transform = fetch_mnt(bbox_l93, _res)
+        # ── Validation ────────────────────────────────────────────────────────
+        a_manquants = []
+        if a_uploaded is None:
+            a_manquants.append("shapefile ZIP")
 
-            # Masquage du MNT par le polygone bufférisé (forme réelle, pas rectangle)
-            # Les pixels hors de la zone + buffer passent à NaN :
-            #   → transparents sur la carte
-            #   → exclus de l'export TXT
-            with st.spinner("Application du masque de zone…"):
-                gdf_l93 = gdf.to_crs("EPSG:2154")
-                geom_buffered = gdf_l93.union_all().buffer(_buf if _buf > 0 else 0)
-                masque = rio_rasterize(
-                    [(geom_buffered.__geo_interface__, 1)],
-                    out_shape=mnt.shape,
-                    transform=transform,
-                    fill=0,
-                    dtype=np.uint8,
-                )
-                mnt = mnt.astype(np.float32)
-                mnt[masque == 0] = np.nan
+        a_pret = len(a_manquants) == 0
+        if not a_pret and not a_locked:
+            st.info("En attente : {}".format(", ".join(a_manquants)))
+        if a_locked:
+            st.info("⏳ Extraction en cours — paramètres verrouillés.")
 
-            # Détection 1m réel vs 5m rééchantillonné par l'API IGN
-            resolution_effective = _res
-            if _res == 1:
-                if not detecter_resolution_reelle(mnt):
-                    resolution_effective = 5
-                    st.session_state.warning_resolution = (
-                        "Données 1 m non disponibles sur cette zone — "
-                        "l'API IGN a retourné du 5 m rééchantillonné (nearest-neighbour). "
-                        "La carte affichée correspond à une interpolation de ces données "
-                        "à la granularité 1 m. "
-                        "Deux exports disponibles ci-dessous : fichier 5 m non interpolé "
-                        "et fichier 1 m interpolé."
+        a_lancer = st.button(
+            "🔍 Lancer l'extraction",
+            disabled=not a_pret or a_locked,
+            use_container_width=True,
+            type="primary",
+            key="a_lancer_btn",
+        )
+
+        st.caption(
+            "⚠️ MNT RGE ALTI IGN — sol nu, végétation et bâtiments non modélisés. "
+            "Précision adaptée au pré-design. Relevé terrain recommandé en phase APD."
+        )
+
+    # ── Déclenchement : double-rerun pour verrouiller avant de calculer ───────
+    if a_lancer and a_uploaded is not None:
+        st.session_state.a__uploaded_bytes = a_uploaded.read()
+        st.session_state.a__uploaded_name = a_uploaded.name
+        st.session_state.a__resolution = a_resolution
+        st.session_state.a__buffer_m = a_buffer_m
+        st.session_state.a_extracting = True
+        st.session_state.a_carte_html = None
+        st.session_state.a_txt_bytes = None
+        st.rerun()
+
+    # ── Colonne droite : rendu (calcul + résultats) ───────────────────────────
+    with col_a_result:
+
+        if not st.session_state.a_extracting and st.session_state.a_txt_bytes is None:
+            # ── État initial : placeholder centré ──
+            st.markdown(
+                """
+                <div style='text-align:center; padding: 80px 40px; color: #999;'>
+                    <div style='font-size:60px'>&#128506;</div>
+                    <p style='margin-top:16px; font-size:15px; line-height:1.8'>
+                    Renseignez les paramètres à gauche<br>
+                    et cliquez sur <strong>Lancer l'extraction</strong>.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        elif st.session_state.a_extracting:
+            # ── Traitement ──
+            _res = st.session_state.a__resolution
+            _buf = st.session_state.a__buffer_m
+
+            try:
+                with st.spinner("Chargement du shapefile…"):
+                    gdf = load_shapefile_from_zip(
+                        io.BytesIO(st.session_state.a__uploaded_bytes)
                     )
-                else:
-                    st.session_state.warning_resolution = None
-            else:
-                st.session_state.warning_resolution = None
-            st.session_state.resolution_effective = resolution_effective
+                    nom_shp = os.path.splitext(st.session_state.a__uploaded_name)[0]
 
-            with st.spinner("Calcul des pentes et orientations…"):
-                # Lissage gaussien pour l'affichage carte (sigma=5 px) si résolution 1m
-                # L'export TXT utilise le MNT brut non lissé
+                with st.spinner("Calcul de l'emprise…"):
+                    bbox_l93 = calculer_bbox_l93(gdf, _buf)
+
+                # Téléchargement MNT (barre de progression intégrée dans fetch_mnt)
+                mnt, transform = fetch_mnt(bbox_l93, _res)
+
+                # Masquage du MNT par le polygone bufférisé (forme réelle, pas rectangle)
+                with st.spinner("Application du masque de zone…"):
+                    gdf_l93 = gdf.to_crs("EPSG:2154")
+                    geom_buffered = gdf_l93.union_all().buffer(_buf if _buf > 0 else 0)
+                    masque = rio_rasterize(
+                        [(geom_buffered.__geo_interface__, 1)],
+                        out_shape=mnt.shape,
+                        transform=transform,
+                        fill=0,
+                        dtype=np.uint8,
+                    )
+                    mnt = mnt.astype(np.float32)
+                    mnt[masque == 0] = np.nan
+
+                # Détection 1m réel vs 5m rééchantillonné par l'API IGN
+                resolution_effective = _res
                 if _res == 1:
-                    mask_nan = np.isnan(mnt)
-                    mnt_tmp = mnt.copy()
-                    mnt_tmp[mask_nan] = float(np.nanmean(mnt))
-                    mnt_affichage = gaussian_filter(mnt_tmp.astype(np.float32), sigma=5.0)
-                    mnt_affichage[mask_nan] = np.nan
+                    if not detecter_resolution_reelle(mnt):
+                        resolution_effective = 5
+                        st.session_state.a_warning_resolution = (
+                            "Données 1 m non disponibles sur cette zone — "
+                            "l'API IGN a retourné du 5 m rééchantillonné (nearest-neighbour). "
+                            "La carte affichée correspond à une interpolation de ces données "
+                            "à la granularité 1 m. "
+                            "Deux exports disponibles ci-dessous : fichier 5 m non interpolé "
+                            "et fichier 1 m interpolé."
+                        )
+                    else:
+                        st.session_state.a_warning_resolution = None
                 else:
-                    mnt_affichage = mnt
-                pentes, orientations = calculer_pentes_et_orientation(mnt_affichage, transform)
+                    st.session_state.a_warning_resolution = None
+                st.session_state.a_resolution_effective = resolution_effective
 
-            with st.spinner("Génération de la carte…"):
-                carte = creer_carte(pentes, orientations, transform, gdf)
-                # Correction bug folium : render() évite le I/O on closed file
-                st.session_state.carte_html = carte.get_root().render()
+                with st.spinner("Calcul des pentes et orientations…"):
+                    # Lissage gaussien pour l'affichage carte (sigma=5 px) si résolution 1m
+                    # L'export TXT utilise le MNT brut non lissé
+                    if _res == 1:
+                        mask_nan = np.isnan(mnt)
+                        mnt_tmp = mnt.copy()
+                        mnt_tmp[mask_nan] = float(np.nanmean(mnt))
+                        mnt_affichage = gaussian_filter(mnt_tmp.astype(np.float32), sigma=5.0)
+                        mnt_affichage[mask_nan] = np.nan
+                    else:
+                        mnt_affichage = mnt
+                    pentes, orientations = calculer_pentes_et_orientation(mnt_affichage, transform)
 
-            with st.spinner("Préparation de l'export TXT…"):
-                if _res == 1 and resolution_effective == 5:
-                    # Cas interpolé : deux exports distincts
-                    # — 5m non interpolé : un point tous les 5 pixels du raster 1m
-                    st.session_state.txt_bytes = exporter_txt(mnt, transform, pas=5)
-                    st.session_state.nom_fichier = f"{nom_shp}_5m.txt"
-                    # — 1m interpolé : grille complète telle que retournée par l'API
-                    st.session_state.txt_bytes_interp = exporter_txt(mnt, transform, pas=1)
-                    st.session_state.nom_fichier_interp = f"{nom_shp}_1m_interpole.txt"
-                else:
-                    # Cas normal : un seul export à la résolution effective
-                    st.session_state.txt_bytes = exporter_txt(mnt, transform, pas=1)
-                    st.session_state.nom_fichier = f"{nom_shp}_{resolution_effective}m.txt"
-                    st.session_state.txt_bytes_interp = None
-                    st.session_state.nom_fichier_interp = None
+                with st.spinner("Génération de la carte…"):
+                    # mnt = MNT brut (non lissé) — utilisé pour les courbes de niveau
+                    _z_min_a = float(np.nanmin(mnt))
+                    _z_max_a = float(np.nanmax(mnt))
+                    _intervalle_a = max(1, round((_z_max_a - _z_min_a) / 20))
+                    st.session_state.a_intervalle_courbes = _intervalle_a
+                    carte = creer_carte(pentes, orientations, transform, gdf, mnt_brut=mnt)
+                    # Correction bug folium : render() évite le I/O on closed file
+                    st.session_state.a_carte_html = carte.get_root().render()
 
-            st.session_state.extracting = False
-            st.rerun()  # rerun final pour déverrouiller les widgets
+                with st.spinner("Préparation de l'export TXT…"):
+                    if _res == 1 and resolution_effective == 5:
+                        # Cas interpolé : deux exports distincts
+                        st.session_state.a_txt_bytes = exporter_txt(mnt, transform, pas=5)
+                        st.session_state.a_nom_fichier = f"{nom_shp}_5m.txt"
+                        st.session_state.a_txt_bytes_interp = exporter_txt(mnt, transform, pas=1)
+                        st.session_state.a_nom_fichier_interp = f"{nom_shp}_1m_interpole.txt"
+                    else:
+                        # Cas normal : un seul export à la résolution effective
+                        st.session_state.a_txt_bytes = exporter_txt(mnt, transform, pas=1)
+                        st.session_state.a_nom_fichier = f"{nom_shp}_{resolution_effective}m.txt"
+                        st.session_state.a_txt_bytes_interp = None
+                        st.session_state.a_nom_fichier_interp = None
 
-        except Exception as e:
-            st.session_state.extracting = False
-            st.error(f"❌ Erreur lors de l'extraction : {e}")
+                st.session_state.a_extracting = False
+                st.rerun()
 
-    else:
-        # ── Résultats : téléchargement en priorité, carte en dessous ──
-        if st.session_state.warning_resolution:
-            st.warning(st.session_state.warning_resolution)
+            except Exception as e:
+                st.session_state.a_extracting = False
+                st.error(f"❌ Erreur lors de l'extraction : {e}")
 
-        res_eff = st.session_state.resolution_effective or st.session_state._resolution
-        req_res = st.session_state._resolution
-        if req_res == 1 and res_eff == 5:
-            st.success("✅ Extraction terminée — résolution effective : 5 m (données 1 m indisponibles sur cette zone)")
         else:
-            st.success(f"✅ Extraction terminée — résolution effective : {res_eff} m")
+            # ── Résultats : téléchargement en priorité, carte en dessous ──
+            if st.session_state.a_warning_resolution:
+                st.warning(st.session_state.a_warning_resolution)
 
-        if st.session_state.txt_bytes_interp:
-            # Cas interpolé : deux boutons côte à côte
-            col_dl1, col_dl2 = st.columns(2)
-            with col_dl1:
+            res_eff = st.session_state.a_resolution_effective or st.session_state.a__resolution
+            req_res = st.session_state.a__resolution
+            if req_res == 1 and res_eff == 5:
+                st.success(
+                    "✅ Extraction terminée — résolution effective : 5 m "
+                    "(données 1 m indisponibles sur cette zone)"
+                )
+            else:
+                st.success(f"✅ Extraction terminée — résolution effective : {res_eff} m")
+
+            if st.session_state.a_intervalle_courbes:
+                st.caption(
+                    f"Courbes de niveau tous les "
+                    f"**{st.session_state.a_intervalle_courbes} m** "
+                    f"(calculé automatiquement selon la plage d'altitude du site)."
+                )
+
+            if st.session_state.a_txt_bytes_interp:
+                # Cas interpolé : deux boutons côte à côte
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    st.download_button(
+                        label=f"⬇️ {st.session_state.a_nom_fichier} — 5 m non interpolé",
+                        data=st.session_state.a_txt_bytes,
+                        file_name=st.session_state.a_nom_fichier,
+                        mime="text/plain",
+                        use_container_width=True,
+                        type="primary",
+                        key="a_dl_5m",
+                    )
+                with col_dl2:
+                    st.download_button(
+                        label=f"⬇️ {st.session_state.a_nom_fichier_interp} — 1 m interpolé (nearest-neighbour)",
+                        data=st.session_state.a_txt_bytes_interp,
+                        file_name=st.session_state.a_nom_fichier_interp,
+                        mime="text/plain",
+                        use_container_width=True,
+                        key="a_dl_1m_interp",
+                    )
+            else:
+                # Cas normal : un seul bouton
                 st.download_button(
-                    label=f"⬇️ {st.session_state.nom_fichier} — 5 m non interpolé",
-                    data=st.session_state.txt_bytes,
-                    file_name=st.session_state.nom_fichier,
+                    label=f"⬇️ Télécharger le fichier TXT PVCase ({st.session_state.a_nom_fichier})",
+                    data=st.session_state.a_txt_bytes,
+                    file_name=st.session_state.a_nom_fichier,
                     mime="text/plain",
                     use_container_width=True,
                     type="primary",
+                    key="a_dl_main",
                 )
-            with col_dl2:
-                st.download_button(
-                    label=f"⬇️ {st.session_state.nom_fichier_interp} — 1 m interpolé (nearest-neighbour)",
-                    data=st.session_state.txt_bytes_interp,
-                    file_name=st.session_state.nom_fichier_interp,
-                    mime="text/plain",
-                    use_container_width=True,
+
+            if st.session_state.a_carte_html:
+                st.components.v1.html(
+                    st.session_state.a_carte_html, height=580, scrolling=False
                 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VOLET B — Conversion données drone UNITe
+# ══════════════════════════════════════════════════════════════════════════════
+
+with onglet_b:
+
+    st.info(
+        "**Conversion courbes de niveau drone → MNT + export TXT PVCase **icon="🚁\n\n"
+        "Ce volet traite les fichiers de courbes de niveau Z issus de relevés drone (GeoJSON ou Shapefile). "
+        "Les courbes (LineString 3D) sont interpolées par triangulation linéaire sur une grille régulière L93. "
+        "Le résultat est exporté au format PVCase Ground Mount (_MULTIPLE _POINT, X,Y,Z en L93).\n\n"
+        "ATTENTION - Pente correcte mais problème identifié au niveau de l'altimétrie des données drones. A corriger dans une version ultérieure.
+    )
+
+    b_locked = st.session_state.b_extracting
+
+    col_b_params, col_b_result = st.columns([1, 2], gap="large")
+
+    # ── Colonne gauche : saisie des paramètres ────────────────────────────────
+    with col_b_params:
+
+        # ── 1. Fichier de courbes ─────────────────────────────────────────────
+        st.subheader("1 · Fichier de courbes")
+        b_uploaded = st.file_uploader(
+            "Déposer le fichier de courbes de niveau (ZIP ou GeoJSON)",
+            type=["zip", "geojson", "json"],
+            disabled=b_locked,
+            key="b_uploader",
+            help=(
+                "Formats acceptés :\n"
+                "- ZIP contenant un .geojson ou un shapefile (.shp)\n"
+                "- GeoJSON direct (.geojson ou .json)\n\n"
+                "Les géométries doivent être de type LineString ou MultiLineString "
+                "avec coordonnées Z (courbes de niveau 3D issues d'un relevé drone)."
+            ),
+        )
+
+        # ── 1b. Zone d'implantation (optionnel) ──────────────────────────────
+        st.subheader("1b · Zone d'implantation — optionnel")
+        b_zone = st.file_uploader(
+            "ZIP shapefile de la zone (optionnel)",
+            type=["zip"],
+            disabled=b_locked,
+            key="b_zone_uploader",
+            help=(
+                "Si fourni : le contour du site s'affiche en jaune pointillé "
+                "et l'overlay de pentes est masqué au polygone.\n"
+                "Si absent : l'enveloppe convexe des courbes est utilisée."
+            ),
+        )
+        if b_zone is not None:
+            st.caption("✅ Zone fournie — le masque sera appliqué au MNT interpolé.")
+            b_buffer_m = st.select_slider(
+                "Buffer autour de la zone d'implantation",
+                options=list(range(0, 31, 5)),
+                value=10,
+                format_func=lambda x: f"{x} m",
+                disabled=b_locked,
+                key="b_buffer_slider",
+                help="Zone étendue autour du shapefile visible sur la carte et incluse dans l'export TXT.",
+            )
         else:
-            # Cas normal : un seul bouton
+            b_buffer_m = 0
+
+        # ── 2. Résolution d'interpolation ─────────────────────────────────────
+        st.subheader("2 · Résolution d'interpolation")
+        b_resolution = st.select_slider(
+            "Résolution de la grille MNT interpolée",
+            options=[round(i * 0.25, 2) for i in range(1, 21)],
+            value=1.0,
+            format_func=lambda x: f"{x:.2f} m",
+            disabled=b_locked,
+            key="b_resolution_slider",
+            help=(
+                "Résolution de la grille régulière résultante :\n"
+                "0.25 m — très haute résolution (grille dense, calcul long)\n"
+                "1.00 m — recommandé (bon compromis précision / taille)\n"
+                "5.00 m — grille légère, compatible avec la résolution ESQ"
+            ),
+        )
+
+        st.divider()
+
+        # ── Validation ────────────────────────────────────────────────────────
+        b_manquants = []
+        if b_uploaded is None:
+            b_manquants.append("fichier de courbes")
+
+        b_pret = len(b_manquants) == 0
+        if not b_pret and not b_locked:
+            st.info("En attente : {}".format(", ".join(b_manquants)))
+        if b_locked:
+            st.info("⏳ Conversion en cours — paramètres verrouillés.")
+
+        b_lancer = st.button(
+            "🔍 Lancer la conversion",
+            disabled=not b_pret or b_locked,
+            use_container_width=True,
+            type="primary",
+            key="b_lancer_btn",
+        )
+
+        st.caption(
+            "⚠️ L'interpolation linéaire retourne NaN hors de l'enveloppe convexe "
+            "des courbes sources. Vérifiez la carte avant export."
+        )
+
+    # ── Déclenchement : double-rerun pour verrouiller avant de calculer ───────
+    if b_lancer and b_uploaded is not None:
+        st.session_state.b__uploaded_bytes = b_uploaded.read()
+        st.session_state.b__uploaded_name = b_uploaded.name
+        st.session_state.b__resolution_drone = b_resolution
+        st.session_state.b__zone_bytes = b_zone.read() if b_zone is not None else None
+        st.session_state.b__zone_name = b_zone.name if b_zone is not None else None
+        st.session_state.b__buffer_m = b_buffer_m
+        st.session_state.b_extracting = True
+        st.session_state.b_carte_html = None
+        st.session_state.b_txt_bytes = None
+        st.rerun()
+
+    # ── Colonne droite : rendu (calcul + résultats) ───────────────────────────
+    with col_b_result:
+
+        if not st.session_state.b_extracting and st.session_state.b_txt_bytes is None:
+            # ── État initial : placeholder centré ──
+            st.markdown(
+                """
+                <div style='text-align:center; padding: 80px 40px; color: #999;'>
+                    <div style='font-size:60px'>🚁</div>
+                    <p style='margin-top:16px; font-size:15px; line-height:1.8'>
+                    Déposez un fichier de courbes de niveau drone<br>
+                    et cliquez sur <strong>Lancer la conversion</strong>.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        elif st.session_state.b_extracting:
+            # ── Traitement ──
+            _fname = st.session_state.b__uploaded_name
+            _raw = st.session_state.b__uploaded_bytes
+            _res_drone = st.session_state.b__resolution_drone
+            _ext = os.path.splitext(_fname)[1].lower().lstrip(".")
+            nom_source = os.path.splitext(_fname)[0]
+
+            try:
+                with st.spinner("Chargement des courbes de niveau…"):
+                    gdf_courbes = charger_courbes(_raw, _ext)
+
+                with st.spinner("Extraction des points XYZ…"):
+                    points_xyz = extraire_points_xyz(gdf_courbes)
+                    n_pts = len(points_xyz)
+
+                with st.spinner(
+                    f"Interpolation du MNT à {_res_drone:.2f} m "
+                    f"({n_pts:,} points sources)…"
+                ):
+                    mnt_b, transform_b = interpoler_mnt(points_xyz, _res_drone)
+
+                # Zone d'implantation : shapefile fourni → masque + contour
+                #                       absent         → enveloppe convexe du nuage
+                _zone_bytes = st.session_state.b__zone_bytes
+                if _zone_bytes is not None:
+                    with st.spinner("Chargement de la zone d'implantation…"):
+                        gdf_zone_b = load_shapefile_from_zip(io.BytesIO(_zone_bytes))
+                        gdf_zone_b_l93 = gdf_zone_b.to_crs("EPSG:2154")
+                        _buf_b = st.session_state.b__buffer_m or 0
+                        geom_zone = (
+                            gdf_zone_b_l93.union_all().buffer(_buf_b)
+                            if _buf_b > 0
+                            else gdf_zone_b_l93.union_all()
+                        )
+                        masque_b = rio_rasterize(
+                            [(geom_zone.__geo_interface__, 1)],
+                            out_shape=mnt_b.shape,
+                            transform=transform_b,
+                            fill=0,
+                            dtype=np.uint8,
+                        )
+                        mnt_b[masque_b == 0] = np.nan
+                    gdf_site_b = gdf_zone_b
+                else:
+                    hull = MultiPoint(
+                        list(zip(points_xyz[:, 0], points_xyz[:, 1]))
+                    ).convex_hull
+                    gdf_site_b = gpd.GeoDataFrame(geometry=[hull], crs="EPSG:2154")
+
+                with st.spinner("Calcul des pentes et orientations…"):
+                    # Lissage gaussien pour les résolutions sub-métriques ou 1 m
+                    if _res_drone <= 1.0:
+                        mask_nan_b = np.isnan(mnt_b)
+                        mnt_tmp_b = mnt_b.copy()
+                        valid_vals = mnt_b[~mask_nan_b]
+                        fill_val = float(valid_vals.mean()) if len(valid_vals) > 0 else 0.0
+                        mnt_tmp_b[mask_nan_b] = fill_val
+                        mnt_affichage_b = gaussian_filter(
+                            mnt_tmp_b.astype(np.float32), sigma=5.0
+                        )
+                        mnt_affichage_b[mask_nan_b] = np.nan
+                    else:
+                        mnt_affichage_b = mnt_b
+                    pentes_b, orientations_b = calculer_pentes_et_orientation(
+                        mnt_affichage_b, transform_b
+                    )
+
+                with st.spinner("Génération de la carte…"):
+                    _z_min_b = float(np.nanmin(mnt_b))
+                    _z_max_b = float(np.nanmax(mnt_b))
+                    _intervalle_b = max(1, round((_z_max_b - _z_min_b) / 20))
+                    st.session_state.b_intervalle_courbes = _intervalle_b
+                    carte_b = creer_carte(pentes_b, orientations_b, transform_b, gdf_site_b, mnt_brut=mnt_b)
+                    st.session_state.b_carte_html = carte_b.get_root().render()
+
+                with st.spinner("Préparation de l'export TXT…"):
+                    res_str = f"{_res_drone:g}"
+                    nom_fichier_b = f"{nom_source}_drone_{res_str}m.txt"
+                    st.session_state.b_txt_bytes = exporter_txt(mnt_b, transform_b, pas=1)
+                    st.session_state.b_nom_fichier = nom_fichier_b
+                    st.session_state.b_n_points = n_pts
+                    st.session_state.b_shape = f"{mnt_b.shape[0]}×{mnt_b.shape[1]}"
+
+                st.session_state.b_extracting = False
+                st.rerun()
+
+            except Exception as e:
+                st.session_state.b_extracting = False
+                st.error(f"❌ Erreur lors de la conversion : {e}")
+
+        else:
+            # ── Résultats : téléchargement en priorité, carte en dessous ──
+            n_pts = st.session_state.b_n_points
+            shape = st.session_state.b_shape
+            res_used = st.session_state.b__resolution_drone
+            if n_pts and shape and res_used is not None:
+                st.success(
+                    f"✅ Conversion terminée — "
+                    f"{n_pts:,} points sources · "
+                    f"grille {shape} · "
+                    f"résolution {res_used:g} m"
+                )
+            else:
+                st.success("✅ Conversion terminée")
+
+            if st.session_state.b_intervalle_courbes:
+                st.caption(
+                    f"Courbes de niveau tous les "
+                    f"**{st.session_state.b_intervalle_courbes} m** "
+                    f"(calculé automatiquement selon la plage d'altitude du site)."
+                )
+
             st.download_button(
-                label=f"⬇️ Télécharger le fichier TXT PVCase ({st.session_state.nom_fichier})",
-                data=st.session_state.txt_bytes,
-                file_name=st.session_state.nom_fichier,
+                label=(
+                    f"⬇️ Télécharger le fichier TXT PVCase "
+                    f"({st.session_state.b_nom_fichier})"
+                ),
+                data=st.session_state.b_txt_bytes,
+                file_name=st.session_state.b_nom_fichier,
                 mime="text/plain",
                 use_container_width=True,
                 type="primary",
+                key="b_dl_main",
             )
-        if st.session_state.carte_html:
-            st.components.v1.html(st.session_state.carte_html, height=580, scrolling=False)
+
+            if st.session_state.b_carte_html:
+                st.components.v1.html(
+                    st.session_state.b_carte_html, height=580, scrolling=False
+                )

@@ -33,10 +33,70 @@ _RATE_LIMIT = 0.2  # secondes entre batches (≤ 5 req/s)
 
 # Palette pente — seuils Fixe (identiques à PV Topo Analyzer)
 _PALETTE = {
-    0: (76, 175, 80),   # vert   — Favorable    < 5 %
-    1: (255, 193, 7),   # jaune  — Acceptable   5–10 %
-    2: (255, 152, 0),   # orange — Contraignant 10–15 %
-    3: (244, 67, 54),   # rouge  — Exclusion    > 15 %
+    0: (76, 175, 80),   # vert   — Favorable
+    1: (255, 193, 7),   # jaune  — Acceptable
+    2: (255, 152, 0),   # orange — Contraignant
+    3: (244, 67, 54),   # rouge  — Exclusion possible
+}
+
+# Seuils de pente par (technologie, puissance, orientation)
+# Format seuils : [favorable_max, acceptable_max, contraignant_max]
+# Au-delà de contraignant_max → Exclusion
+_SEUILS = {
+    ("FIXE", "<5MWc"): {
+        "N":  {"seuils": [3,  5,  15], "note_contraignant": "Ombrage possible"},
+        "S":  {"seuils": [5,  10, 15], "note_contraignant": None},
+        "EO": {"seuils": [5,  10, 15], "note_contraignant": None},
+        "note_globale": None,
+    },
+    ("FIXE", "≥5MWc"): {
+        "N":  {"seuils": [3,  5,  15], "note_contraignant": "Ombrage possible"},
+        "S":  {"seuils": [5,  10, 20], "note_contraignant": None},
+        "EO": {"seuils": [5,  10, 15], "note_contraignant": None},
+        "note_globale": (
+            "Surcout significatif à prévoir à partir du stade « Contraignant » "
+            "selon la proportion de terrain concernée. Au-delà du stade "
+            "« Contraignant », étude de préfaisabilité spécifique au projet nécessaire."
+        ),
+    },
+    ("TRACKERS", "<5MWc"): {
+        "N":  {"seuils": [3, 5, 10], "note_contraignant": None},
+        "S":  {"seuils": [3, 5, 10], "note_contraignant": None},
+        "EO": {"seuils": [3, 5, 10], "note_contraignant": None},
+        "note_globale": (
+            "Le BE interne UNITe étudie actuellement les différentes solutions "
+            "de trackers disponibles sur le marché afin de déterminer le degré "
+            "de pente max admissible. Dans l'attente des résultats, considérer "
+            "en phase ESQ une pente max admissible de 10 %."
+        ),
+    },
+    ("TRACKERS", "≥5MWc"): {
+        "N":  {"seuils": [3, 5, 10], "note_contraignant": None},
+        "S":  {"seuils": [3, 5, 10], "note_contraignant": None},
+        "EO": {"seuils": [3, 5, 10], "note_contraignant": None},
+        "note_globale": (
+            "Le BE interne UNITe étudie actuellement les différentes solutions "
+            "de trackers disponibles sur le marché afin de déterminer le degré "
+            "de pente max admissible. Dans l'attente des résultats, considérer "
+            "en phase ESQ une pente max admissible de 10 %."
+        ),
+    },
+    ("OMBRIÈRES", "<5MWc"): {
+        "N":  {"seuils": [3, 5, 10], "note_contraignant": "Ombrage possible"},
+        "S":  {"seuils": [3, 5, 10], "note_contraignant": None},
+        "EO": {"seuils": [2, 3,  5], "note_contraignant": None},
+        "note_globale": None,
+    },
+    ("OMBRIÈRES", "≥5MWc"): {
+        "N":  {"seuils": [3, 5, 10], "note_contraignant": "Ombrage possible"},
+        "S":  {"seuils": [3, 5, 10], "note_contraignant": None},
+        "EO": {"seuils": [3, 5, 10], "note_contraignant": None},
+        "note_globale": (
+            "Surcout significatif à prévoir à partir du stade « Contraignant » "
+            "selon la proportion de terrain concernée. Au-delà du stade "
+            "« Contraignant », étude de préfaisabilité spécifique au projet nécessaire."
+        ),
+    },
 }
 
 
@@ -218,12 +278,38 @@ def calculer_pentes_et_orientation(mnt: np.ndarray, transform) -> tuple:
 
 # ── 5b. Classification et rendu RGBA ─────────────────────────────────────────
 
-def _classifier(pente: np.ndarray) -> np.ndarray:
-    cls = np.zeros_like(pente, dtype=np.uint8)
-    cls[pente >= 5] = 1
-    cls[pente >= 10] = 2
-    cls[pente >= 15] = 3
-    cls[np.isnan(pente)] = 255
+def classifier_pente_orientee(
+    pentes: np.ndarray,
+    orientations: np.ndarray,
+    technologie: str,
+    puissance: str,
+) -> np.ndarray:
+    """
+    Classifie chaque pixel selon sa pente ET son orientation terrain.
+    Retourne un array uint8 : 0=Favorable 1=Acceptable 2=Contraignant 3=Exclusion 255=NaN
+
+    Orientation terrain (groupes N/S/EO depuis les 8 directions cardinales) :
+      N  : N, NE, NO  (secteur nord)
+      S  : S, SE, SO  (secteur sud)
+      EO : E, O       (secteur est / ouest)
+    """
+    table = _SEUILS[(technologie, puissance)]
+    cls = np.full(pentes.shape, 255, dtype=np.uint8)
+
+    masks_orient = {
+        "N":  np.isin(orientations, ["N", "NE", "NO"]),
+        "S":  np.isin(orientations, ["S", "SE", "SO"]),
+        "EO": np.isin(orientations, ["E", "O"]),
+    }
+
+    for orient, mask_o in masks_orient.items():
+        s1, s2, s3 = table[orient]["seuils"]
+        valid = mask_o & ~np.isnan(pentes)
+        cls[valid & (pentes <  s1)]                        = 0
+        cls[valid & (pentes >= s1) & (pentes <  s2)]       = 1
+        cls[valid & (pentes >= s2) & (pentes <  s3)]       = 2
+        cls[valid & (pentes >= s3)]                        = 3
+
     return cls
 
 
@@ -286,6 +372,8 @@ def creer_carte(
     transform_l93,
     gdf_site: gpd.GeoDataFrame,
     mnt_brut: np.ndarray = None,
+    technologie: str = "FIXE",
+    puissance: str = "<5MWc",
 ) -> folium.Map:
     """
     Carte Folium avec :
@@ -301,7 +389,14 @@ def creer_carte(
     b = union.bounds
     site_bounds = [[b[1], b[0]], [b[3], b[2]]]
 
-    carte = folium.Map(location=centre, zoom_start=15, tiles=None, control_scale=True)
+    carte = folium.Map(
+        location=centre,
+        zoom_start=15,
+        tiles=None,
+        control_scale=True,
+        zoom_snap=0.25,
+        zoom_delta=0.25,
+    )
 
     # Fond OSM puis ESRI — le dernier ajouté est actif par défaut
     folium.TileLayer("OpenStreetMap", name="OpenStreetMap", overlay=False, control=True).add_to(carte)
@@ -314,7 +409,7 @@ def creer_carte(
     ).add_to(carte)
 
     # Overlay pentes (zone + buffer)
-    classes = _classifier(pentes)
+    classes = classifier_pente_orientee(pentes, orientations, technologie, puissance)
     rgba = _to_rgba(classes)
     rgba_wgs84, bounds_pente = _rgba_l93_to_wgs84(rgba, transform_l93)
 
@@ -375,6 +470,14 @@ def creer_carte(
     carte.fit_bounds(site_bounds)
     _ajouter_legende(carte)
     _ajouter_tooltip_hover(carte, pentes, orientations, transform_l93)
+
+    # Logo UNITe — coin supérieur droit de la carte
+    if _logo_b64:
+        carte.get_root().html.add_child(folium.Element(
+            f'<div style="position:absolute;top:10px;right:10px;z-index:1000;pointer-events:none;">'
+            f'<img src="data:image/png;base64,{_logo_b64}" style="height:34px;opacity:0.88;"></div>'
+        ))
+
     return carte
 
 
@@ -391,11 +494,11 @@ def _ajouter_legende(carte: folium.Map) -> None:
 .leaflet-control-attribution {{ font-size:8px !important; opacity:.7; }}
 </style>
 <div id="leg">
-  <b>Pente — seuils Fixe</b><br><br>
-  <span style="background:#4CAF50;{sw}"></span>Favorable (&lt; 5 %)<br>
-  <span style="background:#FFC107;{sw}"></span>Acceptable (5 – 10 %)<br>
-  <span style="background:#FF9800;{sw}"></span>Contraignant (10 – 15 %)<br>
-  <span style="background:#F44336;{sw}"></span>Exclusion (&gt; 15 %)
+  <b>Pente — seuils projet</b><br><br>
+  <span style="background:#4CAF50;{sw}"></span>Favorable<br>
+  <span style="background:#FFC107;{sw}"></span>Acceptable<br>
+  <span style="background:#FF9800;{sw}"></span>Contraignant<br>
+  <span style="background:#F44336;{sw}"></span>Exclusion possible
   <hr style="margin:7px 0;border:none;border-top:1px solid #e0e0e0">
   <div style="display:flex;align-items:center;gap:6px">
     <span style="display:inline-block;width:20px;height:0;border-top:2px dashed #FFE600;flex-shrink:0"></span>
@@ -404,6 +507,65 @@ def _ajouter_legende(carte: folium.Map) -> None:
 </div>
 """
     carte.get_root().html.add_child(folium.Element(html))
+
+
+def afficher_tableau_seuils(technologie: str, puissance: str) -> None:
+    """Affiche un tableau HTML des seuils de pente par orientation avec pastilles colorées."""
+    table = _SEUILS[(technologie, puissance)]
+
+    _COULEURS = {
+        "Favorable":    "#57bb57",
+        "Acceptable":   "#f5e642",
+        "Contraignant": "#f5a623",
+        "Exclusion":    "#e8342a",
+    }
+
+    def _pastille(couleur: str) -> str:
+        return (
+            f'<span style="display:inline-block;width:10px;height:10px;'
+            f'border-radius:50%;background:{couleur};'
+            f'margin-right:5px;vertical-align:middle;"></span>'
+        )
+
+    headers = ["Orientation"] + [
+        f'{_pastille(_COULEURS[col])}{col}'
+        for col in ["Favorable", "Acceptable", "Contraignant", "Exclusion"]
+    ]
+
+    rows_html = ""
+    for orient_label, orient_key in [("Nord", "N"), ("Sud", "S"), ("Est / Ouest", "EO")]:
+        s = table[orient_key]["seuils"]
+        note = table[orient_key]["note_contraignant"]
+        cont_str = f"{s[1]}–{s[2]} %"
+        if note:
+            cont_str += f'<br><span style="font-size:11px;color:#888">({note})</span>'
+        cells = [
+            f"<b>{orient_label}</b>",
+            f"&lt; {s[0]} %",
+            f"{s[0]}–{s[1]} %",
+            cont_str,
+            f"&gt; {s[2]} %",
+        ]
+        rows_html += "<tr>" + "".join(f'<td style="padding:5px 8px;">{c}</td>' for c in cells) + "</tr>"
+
+    html = (
+        '<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+        "<thead>"
+        '<tr style="border-bottom:2px solid #ddd;">'
+        + "".join(
+            f'<th style="text-align:left;padding:6px 8px;">{h}</th>'
+            for h in headers
+        )
+        + "</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        "</table>"
+    )
+
+    st.caption(f"Seuils de pente — **{technologie}** · **{puissance}**")
+    st.markdown(html, unsafe_allow_html=True)
+    note_globale = table.get("note_globale")
+    if note_globale:
+        st.caption(f"ℹ️ {note_globale}")
 
 
 # ── 7. Tooltip hover pente / orientation ─────────────────────────────────────
@@ -562,7 +724,7 @@ def generer_courbes_niveau(mnt: np.ndarray, transform_l93) -> list:
     z_min = np.nanmin(mnt)
     z_max = np.nanmax(mnt)
     if np.isnan(z_min) or z_max - z_min < 1:
-        return []
+        return [], []
 
     # Intervalle arrondi au mètre le plus proche, ~20 courbes sur la plage
     intervalle = max(1, round((z_max - z_min) / 20))
@@ -784,12 +946,32 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🗺️ Données Topo ESQ/APS")
-st.caption(
-    "MNT RGE ALTI IGN (phase ESQ) · "
-    "Conversion données drone UNITe (phase APS) · "
-    "Export TXT PVCase Ground Mount"
-)
+# ── Logo UNITe — chargé une fois, utilisé dans le header ET les cartes Folium ─
+_logo_b64 = None
+try:
+    _logo_path = os.path.join(os.path.dirname(__file__), "logo_unite.png")
+    with open(_logo_path, "rb") as _f:
+        _logo_b64 = base64.b64encode(_f.read()).decode()
+except FileNotFoundError:
+    pass
+
+# Header : titre à gauche, logo à droite dans la même grille de contenu
+_col_titre, _col_logo = st.columns([8, 1], vertical_alignment="center")
+with _col_titre:
+    st.title("🗺️ Données Topo ESQ/APS")
+    st.caption(
+        "MNT RGE ALTI IGN (phase ESQ) · "
+        "Conversion données drone UNITe (phase APS) · "
+        "Export TXT PVCase Ground Mount"
+    )
+with _col_logo:
+    if _logo_b64:
+        st.markdown(
+            f'<div style="text-align:right;">'
+            f'<img src="data:image/png;base64,{_logo_b64}" '
+            f'style="height:85px;max-width:100%;"></div>',
+            unsafe_allow_html=True,
+        )
 st.divider()
 
 # ── Session state — volet A ───────────────────────────────────────────────────
@@ -808,6 +990,11 @@ for _k in ("a__uploaded_bytes", "a__uploaded_name", "a__resolution", "a__buffer_
     if _k not in st.session_state:
         st.session_state[_k] = None
 
+if "a__technologie" not in st.session_state:
+    st.session_state.a__technologie = None
+if "a__puissance" not in st.session_state:
+    st.session_state.a__puissance = None
+
 # ── Session state — volet B ───────────────────────────────────────────────────
 for _k in ("b_carte_html", "b_txt_bytes", "b_nom_fichier", "b_n_points", "b_shape", "b_intervalle_courbes"):
     if _k not in st.session_state:
@@ -823,6 +1010,13 @@ for _k in (
     if _k not in st.session_state:
         st.session_state[_k] = None
 
+if "b__mode" not in st.session_state:
+    st.session_state.b__mode = "Convertir les données"
+if "b__technologie" not in st.session_state:
+    st.session_state.b__technologie = None
+if "b__puissance" not in st.session_state:
+    st.session_state.b__puissance = None
+
 # ── Onglets ───────────────────────────────────────────────────────────────────
 onglet_a, onglet_b = st.tabs([
     "A · Phase ESQ — Extraction RGE ALTI IGN",
@@ -835,6 +1029,13 @@ onglet_a, onglet_b = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 
 with onglet_a:
+
+    st.caption(
+        "🗺️ Ce volet extrait les données altimétriques IGN (MNT RGE ALTI) "
+        "sur la zone d'implantation et les exporte au format PVCase Ground Mount "
+        "(_MULTIPLE _POINT, X,Y,Z en L93)."
+    )
+
 
     # Raccourci : True pendant tout le calcul → désactive les widgets
     a_locked = st.session_state.a_extracting
@@ -860,9 +1061,9 @@ with onglet_a:
             "Résolution du MNT",
             options=[5, 1],
             format_func=lambda x: (
-                "5 m — rapide, recommandé pré-design"
+                "5 m — rapide"
                 if x == 5 else
-                "1 m — précis, ~30–60 s pour 10 ha"
+                "1 m — précis (~30–60 s pour 10 ha)"
             ),
             disabled=a_locked,
             key="a_resolution_radio",
@@ -872,7 +1073,7 @@ with onglet_a:
         # ── 3. Buffer ─────────────────────────────────────────────────────────
         st.subheader("3 · Buffer")
         a_buffer_m = st.select_slider(
-            "Emprise autour de la zone d'implantation",
+            "Emprise à récupérer autour de la zone d'implantation",
             options=list(range(0, 31, 5)),
             value=10,
             format_func=lambda x: f"{x} m",
@@ -881,12 +1082,35 @@ with onglet_a:
             help="Zone étendue autour du shapefile couverte par le MNT et visible sur la carte.",
         )
 
+        # ── 4. Caractéristiques projet ────────────────────────────────────────
+        st.subheader("4 · Caractéristiques projet")
+        technologie_a = st.radio(
+	    "Type de structure",
+            options=["FIXE", "TRACKERS", "OMBRIÈRES"],
+            horizontal=True,
+            index=None,
+            disabled=a_locked,
+            key="a_technologie_radio",
+        )
+        puissance_a = st.radio(
+            "Puissance",
+            options=["<5MWc", "≥5MWc"],
+            horizontal=True,
+            index=None,
+            disabled=a_locked,
+            key="a_puissance_radio",
+        )
+
         st.divider()
 
         # ── Validation ────────────────────────────────────────────────────────
         a_manquants = []
         if a_uploaded is None:
             a_manquants.append("shapefile ZIP")
+        if technologie_a is None:
+            a_manquants.append("type de structure")
+        if puissance_a is None:
+            a_manquants.append("puissance du projet")
 
         a_pret = len(a_manquants) == 0
         if not a_pret and not a_locked:
@@ -913,6 +1137,8 @@ with onglet_a:
         st.session_state.a__uploaded_name = a_uploaded.name
         st.session_state.a__resolution = a_resolution
         st.session_state.a__buffer_m = a_buffer_m
+        st.session_state.a__technologie = technologie_a
+        st.session_state.a__puissance = puissance_a
         st.session_state.a_extracting = True
         st.session_state.a_carte_html = None
         st.session_state.a_txt_bytes = None
@@ -1006,7 +1232,12 @@ with onglet_a:
                     _z_max_a = float(np.nanmax(mnt))
                     _intervalle_a = max(1, round((_z_max_a - _z_min_a) / 20))
                     st.session_state.a_intervalle_courbes = _intervalle_a
-                    carte = creer_carte(pentes, orientations, transform, gdf, mnt_brut=mnt)
+                    carte = creer_carte(
+                        pentes, orientations, transform, gdf,
+                        mnt_brut=mnt,
+                        technologie=st.session_state.a__technologie,
+                        puissance=st.session_state.a__puissance,
+                    )
                     # Correction bug folium : render() évite le I/O on closed file
                     st.session_state.a_carte_html = carte.get_root().render()
 
@@ -1091,6 +1322,10 @@ with onglet_a:
                 st.components.v1.html(
                     st.session_state.a_carte_html, height=580, scrolling=False
                 )
+                afficher_tableau_seuils(
+                    st.session_state.a__technologie or "FIXE",
+                    st.session_state.a__puissance or "<5MWc",
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1099,12 +1334,10 @@ with onglet_a:
 
 with onglet_b:
 
-    st.info(
-        "**Conversion courbes de niveau drone → MNT + export TXT PVCase**\n\n"
-        "Ce volet traite les fichiers de courbes de niveau Z issus de relevés drone (GeoJSON ou Shapefile). "
-        "Les courbes (LineString 3D) sont interpolées par triangulation linéaire sur une grille régulière L93. "
-        "Le résultat est exporté au format PVCase Ground Mount (_MULTIPLE _POINT, X,Y,Z en L93).\n\n"
-        "ATTENTION - Pente correcte mais problème identifié au niveau de l'altimétrie des données drones. A corriger dans une version ultérieure."
+    st.caption(
+        "🚁 Ce volet convertit les courbes de niveau issues de relevés drone "
+        "(GeoJSON, Shapefile, GeoTIFF ou DXF) au format PVCase Ground Mount "
+        "(_MULTIPLE _POINT, X,Y,Z en L93)."
     )
 
     b_locked = st.session_state.b_extracting
@@ -1114,8 +1347,8 @@ with onglet_b:
     # ── Colonne gauche : saisie des paramètres ────────────────────────────────
     with col_b_params:
 
-        # ── 1. Fichier de courbes ─────────────────────────────────────────────
-        st.subheader("1 · Fichier de courbes")
+        # ── 1. Fichier de données drone ───────────────────────────────────────
+        st.subheader("1 · Fichier de données drone")
         b_uploaded = st.file_uploader(
             "Déposer le fichier de courbes de niveau (ZIP ou GeoJSON)",
             type=["zip", "geojson", "json"],
@@ -1129,33 +1362,6 @@ with onglet_b:
                 "avec coordonnées Z (courbes de niveau 3D issues d'un relevé drone)."
             ),
         )
-
-        # ── 1b. Zone d'implantation (optionnel) ──────────────────────────────
-        st.subheader("1b · Zone d'implantation — optionnel")
-        b_zone = st.file_uploader(
-            "ZIP shapefile de la zone (optionnel)",
-            type=["zip"],
-            disabled=b_locked,
-            key="b_zone_uploader",
-            help=(
-                "Si fourni : le contour du site s'affiche en jaune pointillé "
-                "et l'overlay de pentes est masqué au polygone.\n"
-                "Si absent : l'enveloppe convexe des courbes est utilisée."
-            ),
-        )
-        if b_zone is not None:
-            st.caption("✅ Zone fournie — le masque sera appliqué au MNT interpolé.")
-            b_buffer_m = st.select_slider(
-                "Buffer autour de la zone d'implantation",
-                options=list(range(0, 31, 5)),
-                value=10,
-                format_func=lambda x: f"{x} m",
-                disabled=b_locked,
-                key="b_buffer_slider",
-                help="Zone étendue autour du shapefile visible sur la carte et incluse dans l'export TXT.",
-            )
-        else:
-            b_buffer_m = 0
 
         # ── 2. Résolution d'interpolation ─────────────────────────────────────
         st.subheader("2 · Résolution d'interpolation")
@@ -1174,12 +1380,83 @@ with onglet_b:
             ),
         )
 
+        # ── 3. Mode ───────────────────────────────────────────────────────────
+        st.subheader("3 · Mode")
+        b_mode = st.radio(
+            "Mode de traitement",
+            options=["Convertir les données", "Convertir les données et afficher la carte"],
+            disabled=b_locked,
+            key="b_mode_radio",
+            help=(
+                "Convertir les données : pipeline court — export TXT uniquement, rapide.\n"
+                "Convertir les données et afficher la carte : pipeline complet — carte "
+                "interactive avec pentes, courbes de niveau et options projet."
+            ),
+        )
+
+        if b_mode == "Convertir les données et afficher la carte":
+            # ── Zone d'implantation (optionnel) ──────────────────────────────
+            st.subheader("Zone d'implantation — optionnel")
+            b_zone = st.file_uploader(
+                "ZIP shapefile de la zone (optionnel)",
+                type=["zip"],
+                disabled=b_locked,
+                key="b_zone_uploader",
+                help=(
+                    "Si fourni : le contour du site s'affiche en jaune pointillé "
+                    "et l'overlay de pentes est masqué au polygone.\n"
+                    "Si absent : l'enveloppe convexe des courbes est utilisée."
+                ),
+            )
+            if b_zone is not None:
+                st.caption("✅ Zone fournie — le masque sera appliqué au MNT interpolé.")
+                b_buffer_m = st.select_slider(
+                    "Buffer autour de la zone d'implantation",
+                    options=list(range(0, 31, 5)),
+                    value=10,
+                    format_func=lambda x: f"{x} m",
+                    disabled=b_locked,
+                    key="b_buffer_slider",
+                    help="Zone étendue autour du shapefile visible sur la carte et incluse dans l'export TXT.",
+                )
+            else:
+                b_buffer_m = 0
+
+            # ── Caractéristiques projet ───────────────────────────────────────
+            st.subheader("Caractéristiques projet")
+            technologie_b = st.radio(
+                "Type de structure",
+                options=["FIXE", "TRACKERS", "OMBRIÈRES"],
+                horizontal=True,
+                index=None,
+                disabled=b_locked,
+                key="b_technologie_radio",
+            )
+            puissance_b = st.radio(
+                "Puissance",
+                options=["<5MWc", "≥5MWc"],
+                horizontal=True,
+                index=None,
+                disabled=b_locked,
+                key="b_puissance_radio",
+            )
+        else:
+            b_zone = None
+            b_buffer_m = 0
+            technologie_b = None
+            puissance_b = None
+
         st.divider()
 
         # ── Validation ────────────────────────────────────────────────────────
         b_manquants = []
         if b_uploaded is None:
             b_manquants.append("fichier de courbes")
+        if b_mode == "Convertir les données et afficher la carte":
+            if technologie_b is None:
+                b_manquants.append("type de structure")
+            if puissance_b is None:
+                b_manquants.append("puissance du projet")
 
         b_pret = len(b_manquants) == 0
         if not b_pret and not b_locked:
@@ -1188,7 +1465,7 @@ with onglet_b:
             st.info("⏳ Conversion en cours — paramètres verrouillés.")
 
         b_lancer = st.button(
-            "🔍 Lancer la conversion",
+            "⚙️ Lancer la conversion",
             disabled=not b_pret or b_locked,
             use_container_width=True,
             type="primary",
@@ -1208,6 +1485,9 @@ with onglet_b:
         st.session_state.b__zone_bytes = b_zone.read() if b_zone is not None else None
         st.session_state.b__zone_name = b_zone.name if b_zone is not None else None
         st.session_state.b__buffer_m = b_buffer_m
+        st.session_state.b__mode = b_mode
+        st.session_state.b__technologie = technologie_b
+        st.session_state.b__puissance = puissance_b
         st.session_state.b_extracting = True
         st.session_state.b_carte_html = None
         st.session_state.b_txt_bytes = None
@@ -1238,6 +1518,7 @@ with onglet_b:
             _res_drone = st.session_state.b__resolution_drone
             _ext = os.path.splitext(_fname)[1].lower().lstrip(".")
             nom_source = os.path.splitext(_fname)[0]
+            _mode = st.session_state.b__mode
 
             try:
                 with st.spinner("Chargement des courbes de niveau…"):
@@ -1253,59 +1534,69 @@ with onglet_b:
                 ):
                     mnt_b, transform_b = interpoler_mnt(points_xyz, _res_drone)
 
-                # Zone d'implantation : shapefile fourni → masque + contour
-                #                       absent         → enveloppe convexe du nuage
-                _zone_bytes = st.session_state.b__zone_bytes
-                if _zone_bytes is not None:
-                    with st.spinner("Chargement de la zone d'implantation…"):
-                        gdf_zone_b = load_shapefile_from_zip(io.BytesIO(_zone_bytes))
-                        gdf_zone_b_l93 = gdf_zone_b.to_crs("EPSG:2154")
-                        _buf_b = st.session_state.b__buffer_m or 0
-                        geom_zone = (
-                            gdf_zone_b_l93.union_all().buffer(_buf_b)
-                            if _buf_b > 0
-                            else gdf_zone_b_l93.union_all()
-                        )
-                        masque_b = rio_rasterize(
-                            [(geom_zone.__geo_interface__, 1)],
-                            out_shape=mnt_b.shape,
-                            transform=transform_b,
-                            fill=0,
-                            dtype=np.uint8,
-                        )
-                        mnt_b[masque_b == 0] = np.nan
-                    gdf_site_b = gdf_zone_b
-                else:
-                    hull = MultiPoint(
-                        list(zip(points_xyz[:, 0], points_xyz[:, 1]))
-                    ).convex_hull
-                    gdf_site_b = gpd.GeoDataFrame(geometry=[hull], crs="EPSG:2154")
-
-                with st.spinner("Calcul des pentes et orientations…"):
-                    # Lissage gaussien pour les résolutions sub-métriques ou 1 m
-                    if _res_drone <= 1.0:
-                        mask_nan_b = np.isnan(mnt_b)
-                        mnt_tmp_b = mnt_b.copy()
-                        valid_vals = mnt_b[~mask_nan_b]
-                        fill_val = float(valid_vals.mean()) if len(valid_vals) > 0 else 0.0
-                        mnt_tmp_b[mask_nan_b] = fill_val
-                        mnt_affichage_b = gaussian_filter(
-                            mnt_tmp_b.astype(np.float32), sigma=5.0
-                        )
-                        mnt_affichage_b[mask_nan_b] = np.nan
+                if _mode == "Convertir les données et afficher la carte":
+                    # Zone d'implantation : shapefile fourni → masque + contour
+                    #                       absent         → enveloppe convexe du nuage
+                    _zone_bytes = st.session_state.b__zone_bytes
+                    if _zone_bytes is not None:
+                        with st.spinner("Chargement de la zone d'implantation…"):
+                            gdf_zone_b = load_shapefile_from_zip(io.BytesIO(_zone_bytes))
+                            gdf_zone_b_l93 = gdf_zone_b.to_crs("EPSG:2154")
+                            _buf_b = st.session_state.b__buffer_m or 0
+                            geom_zone = (
+                                gdf_zone_b_l93.union_all().buffer(_buf_b)
+                                if _buf_b > 0
+                                else gdf_zone_b_l93.union_all()
+                            )
+                            masque_b = rio_rasterize(
+                                [(geom_zone.__geo_interface__, 1)],
+                                out_shape=mnt_b.shape,
+                                transform=transform_b,
+                                fill=0,
+                                dtype=np.uint8,
+                            )
+                            mnt_b[masque_b == 0] = np.nan
+                        gdf_site_b = gdf_zone_b
                     else:
-                        mnt_affichage_b = mnt_b
-                    pentes_b, orientations_b = calculer_pentes_et_orientation(
-                        mnt_affichage_b, transform_b
-                    )
+                        hull = MultiPoint(
+                            list(zip(points_xyz[:, 0], points_xyz[:, 1]))
+                        ).convex_hull
+                        gdf_site_b = gpd.GeoDataFrame(geometry=[hull], crs="EPSG:2154")
 
-                with st.spinner("Génération de la carte…"):
-                    _z_min_b = float(np.nanmin(mnt_b))
-                    _z_max_b = float(np.nanmax(mnt_b))
-                    _intervalle_b = max(1, round((_z_max_b - _z_min_b) / 20))
-                    st.session_state.b_intervalle_courbes = _intervalle_b
-                    carte_b = creer_carte(pentes_b, orientations_b, transform_b, gdf_site_b, mnt_brut=mnt_b)
-                    st.session_state.b_carte_html = carte_b.get_root().render()
+                    with st.spinner("Calcul des pentes et orientations…"):
+                        # Lissage gaussien pour les résolutions sub-métriques ou 1 m
+                        if _res_drone <= 1.0:
+                            mask_nan_b = np.isnan(mnt_b)
+                            mnt_tmp_b = mnt_b.copy()
+                            valid_vals = mnt_b[~mask_nan_b]
+                            fill_val = float(valid_vals.mean()) if len(valid_vals) > 0 else 0.0
+                            mnt_tmp_b[mask_nan_b] = fill_val
+                            mnt_affichage_b = gaussian_filter(
+                                mnt_tmp_b.astype(np.float32), sigma=5.0
+                            )
+                            mnt_affichage_b[mask_nan_b] = np.nan
+                        else:
+                            mnt_affichage_b = mnt_b
+                        pentes_b, orientations_b = calculer_pentes_et_orientation(
+                            mnt_affichage_b, transform_b
+                        )
+
+                    with st.spinner("Génération de la carte…"):
+                        _z_min_b = float(np.nanmin(mnt_b))
+                        _z_max_b = float(np.nanmax(mnt_b))
+                        _intervalle_b = max(1, round((_z_max_b - _z_min_b) / 20))
+                        st.session_state.b_intervalle_courbes = _intervalle_b
+                        carte_b = creer_carte(
+                            pentes_b, orientations_b, transform_b, gdf_site_b,
+                            mnt_brut=mnt_b,
+                            technologie=st.session_state.b__technologie,
+                            puissance=st.session_state.b__puissance,
+                        )
+                        st.session_state.b_carte_html = carte_b.get_root().render()
+                else:
+                    # Mode convert : pipeline court, pas de génération de carte
+                    st.session_state.b_carte_html = None
+                    st.session_state.b_intervalle_courbes = None
 
                 with st.spinner("Préparation de l'export TXT…"):
                     res_str = f"{_res_drone:g}"
@@ -1361,3 +1652,8 @@ with onglet_b:
                 st.components.v1.html(
                     st.session_state.b_carte_html, height=580, scrolling=False
                 )
+                if st.session_state.b__technologie and st.session_state.b__puissance:
+                    afficher_tableau_seuils(
+                        st.session_state.b__technologie,
+                        st.session_state.b__puissance,
+                    )

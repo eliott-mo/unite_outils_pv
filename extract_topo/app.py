@@ -1200,7 +1200,7 @@ with onglet_a:
                     if not detecter_resolution_reelle(mnt):
                         resolution_effective = 5
                         st.session_state.a_warning_resolution = (
-                            "Données 1 m non disponibles sur cette zone — "
+                            "Données 1 m de qualité réduite détectée sur cette zone (acquisition photogrammétrique probable — millésime ancien) — "
                             "l'API IGN a retourné du 5 m rééchantillonné (nearest-neighbour). "
                             "La carte affichée correspond à une interpolation de ces données "
                             "à la granularité 1 m. "

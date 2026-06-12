@@ -135,107 +135,83 @@ def to_dms(deg, is_lat):
 
 def calcul_extremaux(terrain, tr, echelle=5000):
     """
-    Selectionne jusqu'a 4 points cardinaux (N/S/E/O) sur l'enveloppe convexe
-    du terrain avec deduplication maximin et offsets d'annotation radiaux.
+    Selectionne jusqu'a 4 points sur l'enveloppe convexe avec repartition optimale.
 
     Algorithme
     ----------
-    1. Calculer les 4 extrema cardinaux (N=max Y, S=min Y, E=max X, O=min X).
-    2. Selectionner dans l'ordre N, S, E, O.
-       Si le candidat est a moins de MIN_DIST d'un point deja retenu,
-       le remplacer par le sommet du hull non encore selectionne qui maximise
-       la distance minimale a l'ensemble des points retenus.
-       Si aucun remplacement valide -> point omis.
-       MIN_DIST = max(5 % diagonale terrain, 1 m).
-    3. Offset radial depuis le centroide (8 octants).
-    4. Anti-chevauchement iteratif des encarts (push perpendiculaire).
+    1. A = sommet le plus au nord (max Y).
+    2. B = sommet maximisant la distance a A.
+    3. C = sommet maximisant la distance minimale a {A, B} (maximin).
+    4. D = sommet maximisant la distance minimale a {A, B, C} (maximin).
+    Contrainte : si le meilleur candidat est a moins de MIN_DIST (15 % diagonale)
+    du plus proche point deja selectionne, on force le sommet globalement le plus
+    eloigne (meme resultat sur formes convexes regulieres, correction sur formes
+    degenrees a peu de sommets).
     """
     hull_pts = np.array(terrain.convex_hull.exterior.coords[:-1])
     n        = len(hull_pts)
     cx, cy   = terrain.centroid.x, terrain.centroid.y
 
     minx, miny, maxx, maxy = terrain.bounds
-    diag     = math.hypot(maxx - minx, maxy - miny)
-    MIN_DIST = max(diag * 0.05, 1.0)
+    M_PER_PT = echelle * 0.0254 / 72   # metres par point typographique
+    BOX_W, BOX_H = 92, 52              # taille boite en pts (fixe — la fonte est fixe)
 
-    def hdist(i, j):
-        return math.hypot(hull_pts[i][0] - hull_pts[j][0],
-                          hull_pts[i][1] - hull_pts[j][1])
+    # PUSH : depasse la demi-largeur du terrain + marge lisible, cap a 150 pts
+    terrain_hw = max(maxx - minx, maxy - miny) / 2
+    PUSH = max(min(int(terrain_hw / M_PER_PT) + 25, 150), 40)
+    diag = math.hypot(maxx - minx, maxy - miny)
 
-    def min_dist_to_sel(k, sel):
-        return min(hdist(k, s) for s in sel)
-
-    cardinal = [
-        ("A", int(np.argmax(hull_pts[:, 1]))),   # nord
-        ("B", int(np.argmin(hull_pts[:, 1]))),   # sud
-        ("C", int(np.argmax(hull_pts[:, 0]))),   # est
-        ("D", int(np.argmin(hull_pts[:, 0]))),   # ouest
+    # ── Selection cardinale : A=N (max Y), B=E (max X), C=S (min Y), D=W (min X) ─
+    card_cfg = [
+        ("A", int(np.argmax(hull_pts[:, 1])), (-BOX_W // 2,  PUSH),           (0.0,  1.0)),
+        ("B", int(np.argmax(hull_pts[:, 0])), (PUSH, -BOX_H // 2),            (1.0,  0.0)),
+        ("C", int(np.argmin(hull_pts[:, 1])), (-BOX_W // 2, -(BOX_H + PUSH)), (0.0, -1.0)),
+        ("D", int(np.argmin(hull_pts[:, 0])), (-(BOX_W + PUSH), -BOX_H // 2), (-1.0, 0.0)),
     ]
 
-    sel_idx = []
-    sel_lbl = []
-
-    for lbl, idx in cardinal:
-        ok = (not sel_idx) or all(hdist(idx, si) >= MIN_DIST for si in sel_idx)
-        if ok:
-            sel_idx.append(idx)
-            sel_lbl.append(lbl)
-        else:
-            # Remplacement maximin : sommet non retenu le plus eloigne des selectionnes
-            remaining = [k for k in range(n) if k not in sel_idx]
-            if remaining:
-                best = max(remaining, key=lambda k: min_dist_to_sel(k, sel_idx))
-                if min_dist_to_sel(best, sel_idx) >= MIN_DIST:
-                    sel_idx.append(best)
-                    sel_lbl.append(lbl)
-                else:
-                    print("  [extremaux] Pt {} omis (terrain trop compact)".format(lbl))
-            else:
-                print("  [extremaux] Pt {} omis (pas de sommet disponible)".format(lbl))
-
-    # \u2500\u2500 Offsets radiaux (8 octants depuis centroide) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    M_PER_PT = echelle * 0.0254 / 72
-    BOX_W    = 92
-    BOX_H    = 52
-    PUSH     = 8
-
+    used_idx = set()
     result = []
-    for lbl, idx in zip(sel_lbl, sel_idx):
-        px, py = hull_pts[idx]
+    for lbl, idx, (adx, ady), (dux, duy) in card_cfg:
+        if idx in used_idx:
+            remaining = [k for k in range(n) if k not in used_idx]
+            if not remaining:
+                continue
+            if   duy > 0: idx = int(max(remaining, key=lambda k: hull_pts[k][1]))
+            elif dux > 0: idx = int(max(remaining, key=lambda k: hull_pts[k][0]))
+            elif duy < 0: idx = int(min(remaining, key=lambda k: hull_pts[k][1]))
+            else:         idx = int(min(remaining, key=lambda k: hull_pts[k][0]))
+        # Corner-snapping : si un sommet voisin (< 15% diag) est plus eloigne du
+        # centroide, il est plus "en coin" — on le prefere.
+        snap_r = diag * 0.15
+        _px0, _py0 = hull_pts[idx]
+        _d0 = math.hypot(_px0 - cx, _py0 - cy)
+        for _k in range(n):
+            if _k == idx or _k in used_idx:
+                continue
+            _pkx, _pky = hull_pts[_k]
+            if math.hypot(_pkx - _px0, _pky - _py0) <= snap_r:
+                _dk = math.hypot(_pkx - cx, _pky - cy)
+                if _dk > _d0:
+                    idx = _k
+                    _d0 = _dk
+        used_idx.add(idx)
+        px, py   = hull_pts[idx]
         lon, lat = tr.transform(px, py)
-
-        ux = px - cx; uy = py - cy
-        norm  = max(math.hypot(ux, uy), 1e-6)
-        ux   /= norm; uy /= norm
-        angle = math.degrees(math.atan2(uy, ux))
-
-        if   -22.5 <= angle <  22.5:   adx, ady = PUSH,             -BOX_H // 2
-        elif  22.5 <= angle <  67.5:   adx, ady = PUSH,              PUSH
-        elif  67.5 <= angle < 112.5:   adx, ady = -BOX_W // 2,       PUSH
-        elif 112.5 <= angle < 157.5:   adx, ady = -(BOX_W + PUSH),   PUSH
-        elif angle >= 157.5 or angle < -157.5:
-                                       adx, ady = -(BOX_W + PUSH),  -BOX_H // 2
-        elif -157.5 <= angle < -112.5: adx, ady = -(BOX_W + PUSH), -(BOX_H + PUSH)
-        elif -112.5 <= angle <  -67.5: adx, ady = -BOX_W // 2,     -(BOX_H + PUSH)
-        else:                          adx, ady = PUSH,             -(BOX_H + PUSH)
-
         result.append({
             "label":  "Pt {}".format(lbl),
             "x": px, "y": py,
             "lat":    to_dms(lat, True),
             "lon":    to_dms(lon, False),
             "ann_dx": adx, "ann_dy": ady,
-            "_ux":    ux, "_uy": uy,
+            "_ux": dux, "_uy": duy,
         })
 
-    # \u2500\u2500 Anti-chevauchement perpendiculaire iteratif \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    GAP      = 6
-    STEP     = 10
-    MAX_ITER = 30
-    THRESH_X = (BOX_W + GAP) * M_PER_PT
-    THRESH_Y = (BOX_H + GAP) * M_PER_PT
+    # Anti-chevauchement AABB : push sur l'axe de chevauchement minimal
+    THRESH_X = (BOX_W + 6) * M_PER_PT
+    THRESH_Y = (BOX_H + 6) * M_PER_PT
+    STEP     = 12
 
-    for _ in range(MAX_ITER):
+    for _ in range(60):
         moved = False
         for i in range(len(result)):
             for j in range(i + 1, len(result)):
@@ -244,20 +220,17 @@ def calcul_extremaux(terrain, tr, echelle=5000):
                 cyi = ri["y"] + (ri["ann_dy"] + BOX_H / 2) * M_PER_PT
                 cxj = rj["x"] + (rj["ann_dx"] + BOX_W / 2) * M_PER_PT
                 cyj = rj["y"] + (rj["ann_dy"] + BOX_H / 2) * M_PER_PT
-                if abs(cxi - cxj) < THRESH_X and abs(cyi - cyj) < THRESH_Y:
-                    sx = cxj - cxi; sy = cyj - cyi
-                    snorm = max(math.hypot(sx, sy), 1e-6)
-                    sx /= snorm; sy /= snorm
-                    pi_x, pi_y = -ri["_uy"],  ri["_ux"]
-                    pj_x, pj_y = -rj["_uy"],  rj["_ux"]
-                    dot_i = pi_x * sx + pi_y * sy
-                    dot_j = pj_x * sx + pj_y * sy
-                    si = -math.copysign(1.0, dot_i) if abs(dot_i) > 1e-9 else  1.0
-                    sj =  math.copysign(1.0, dot_j) if abs(dot_j) > 1e-9 else -1.0
-                    result[i]["ann_dx"] = int(ri["ann_dx"] + si * pi_x * STEP)
-                    result[i]["ann_dy"] = int(ri["ann_dy"] + si * pi_y * STEP)
-                    result[j]["ann_dx"] = int(rj["ann_dx"] + sj * pj_x * STEP)
-                    result[j]["ann_dy"] = int(rj["ann_dy"] + sj * pj_y * STEP)
+                ovx = THRESH_X - abs(cxi - cxj)
+                ovy = THRESH_Y - abs(cyi - cyj)
+                if ovx > 0 and ovy > 0:
+                    if ovx < ovy:
+                        push = math.copysign(ovx / 2 / M_PER_PT + STEP, cxi - cxj) or float(STEP)
+                        result[i]["ann_dx"] = int(ri["ann_dx"] + push)
+                        result[j]["ann_dx"] = int(rj["ann_dx"] - push)
+                    else:
+                        push = math.copysign(ovy / 2 / M_PER_PT + STEP, cyi - cyj) or float(STEP)
+                        result[i]["ann_dy"] = int(ri["ann_dy"] + push)
+                        result[j]["ann_dy"] = int(rj["ann_dy"] - push)
                     moved = True
         if not moved:
             break
@@ -355,7 +328,7 @@ def draw_hatch(ax, geom, ec="#0077BB", fc="#AEE4FF", hatch="////",
 # ════════════════════════════════════════════════════════════════
 
 def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
-                  echelle=5000, fond_aerien=True, dpi=150, buffer_carte=650,
+                  echelle=5000, fond_aerien=True, dpi=150, buffer_carte=800,
                   tick_deg=0.005, zh_path=None, elements_path=None,
                   kml_panneaux=None, kml_pistes=None,
                   urba_terrain=False, urba_buffer=True,
@@ -372,7 +345,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     echelle         : dénominateur échelle (défaut 5000)
     fond_aerien     : True = IGN Géoportail
     dpi             : résolution image (défaut 150)
-    buffer_carte    : rayon emprise carte en mètres (défaut 650)
+    buffer_carte    : rayon emprise carte en mètres (défaut 800)
     tick_deg        : intervalle ticks WGS84 en degrés (défaut 0.005)
     zh_path         : chemin couche zones humides (.zip, .kml, .geojson) — optionnel
     elements_path   : chemin couche éléments techniques (.kml) — fallback si un seul KML
@@ -715,15 +688,26 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                     except Exception:
                         rx = None
                     if rx is not None and x0 <= rx <= x1 and y0 <= ry <= y1:
-                        txt_color = (COULEURS_PLU[tz]["ec"]
-                                     if tz else "#888888")
-                        ax.text(rx, ry, lbl_txt,
-                                fontsize=8, fontweight="bold",
-                                color=txt_color,
-                                ha="center", va="center",
-                                bbox=dict(boxstyle="round,pad=0.2",
-                                          fc="white", alpha=0.80, ec="none"),
-                                zorder=20, clip_on=True)
+                        _M = echelle * 0.0254 / 72
+                        _pts_pos = (
+                            [(pt["x"], pt["y"]) for pt in extremal] +
+                            [(pt["x"] + (pt["ann_dx"] + 46) * _M,
+                              pt["y"] + (pt["ann_dy"] + 26) * _M) for pt in extremal]
+                        )
+                        _trop_proche = any(
+                            ((rx - px)**2 + (ry - py)**2) < (geo_w * 0.07)**2
+                            for px, py in _pts_pos
+                        )
+                        if not _trop_proche:
+                            txt_color = (COULEURS_PLU[tz]["ec"]
+                                         if tz else "#888888")
+                            ax.text(rx, ry, lbl_txt,
+                                    fontsize=8, fontweight="bold",
+                                    color=txt_color,
+                                    ha="center", va="center",
+                                    bbox=dict(boxstyle="round,pad=0.2",
+                                              fc="white", alpha=0.80, ec="none"),
+                                    zorder=20, clip_on=True)
 
 
     # ── Zones non couvertes par le PLU = RNU ou hors périmètre GPU ─────────
@@ -834,6 +818,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
                     xytext=(pt["ann_dx"], pt["ann_dy"]),
                     textcoords="offset points",
                     fontsize=7.5, color="#660000", fontweight="bold",
+                    arrowprops=dict(arrowstyle="-", color="#990000", lw=0.8),
                     bbox=dict(boxstyle="round,pad=0.3", fc="white",
                               alpha=0.92, ec="#990000", lw=0.8), zorder=15)
 
@@ -909,7 +894,9 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         )
 
     leg = ax.legend(handles=legend_items, loc="lower left",
-                    fontsize=9, framealpha=0.93, edgecolor="#cccccc")
+                    fontsize=9, framealpha=0.97, edgecolor="#cccccc",
+                    bbox_to_anchor=(0.01, 0.01), bbox_transform=ax.transAxes)
+    leg.set_zorder(25)
 
     # Mise en forme de la note (italique gris, handle invisible)
     if _show_note:
@@ -928,11 +915,11 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
 
     # ── Encart urbanisme ──────────────────────────────────────────────────────
     if urbanisme.strip():
-        ax.text(x1 - geo_w * 0.02, y1 - geo_h * 0.02,
+        ax.text(x1 - geo_w * 0.01, y1 - geo_h * 0.01,
                 "Document d'urbanisme applicable\nau terrain d'implantation\n{}\n{}".format("\u2500" * 10, urbanisme),
                 ha="right", va="top", fontsize=10, weight="bold", linespacing=1.7,
                 bbox=dict(boxstyle="round,pad=0.6", fc="white",
-                          alpha=0.93, ec="#CC0000", lw=2.5), zorder=11)
+                          alpha=0.97, ec="#cccccc", lw=0.8), zorder=25)
 
     # ── Axes WGS84 ────────────────────────────────────────────────────────────
     _tr_wgs = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)

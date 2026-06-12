@@ -5,7 +5,7 @@ UNITe PV — AO CRE Sol Période 9
 Lancement local : streamlit run app.py
 """
 
-import os, re, zipfile, tempfile
+import os, re, zipfile, tempfile, base64
 import streamlit as st
 from ceti_generate_map import generer_carte
 
@@ -79,8 +79,28 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🗺️ CETI - Générateur plan de situation")
-st.caption("AO CRE PV Sol · Compatible CdC Période 9 · UNITe")
+# ── Logo UNITe — chargé une fois pour le header
+_logo_b64 = None
+try:
+    _logo_path = os.path.join(os.path.dirname(__file__), "logo_unite.png")
+    with open(_logo_path, "rb") as _f:
+        _logo_b64 = base64.b64encode(_f.read()).decode()
+except FileNotFoundError:
+    pass
+
+# Header : titre à gauche, logo à droite
+_col_titre, _col_logo = st.columns([8, 1], vertical_alignment="center")
+with _col_titre:
+    st.title("🗺️ CETI - Générateur plan de situation")
+    st.caption("AO CRE PV Sol · Compatible CdC Période 9 · UNITe")
+with _col_logo:
+    if _logo_b64:
+        st.markdown(
+            f'<div style="text-align:right;">' 
+            f'<img src="data:image/png;base64,{_logo_b64}" ' 
+            f'style="height:85px;max-width:100%;"></div>',
+            unsafe_allow_html=True,
+        )
 st.divider()
 
 col_params, col_result = st.columns([1, 2], gap="large")

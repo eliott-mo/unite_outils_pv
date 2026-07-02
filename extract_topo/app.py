@@ -25,6 +25,7 @@ from scipy.interpolate import griddata as scipy_griddata
 from shapely.geometry import MultiPoint
 from skimage import measure as skimage_measure
 from streamlit_folium import st_folium
+from export_carte import generer_image_carte, png_vers_pdf
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 _URL_ALTI = "https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json"
@@ -979,6 +980,7 @@ for _k in (
     "a_carte_html", "a_txt_bytes", "a_nom_fichier", "a_intervalle_courbes",
     "a_txt_bytes_interp", "a_nom_fichier_interp",
     "a_resolution_effective", "a_warning_resolution",
+    "a_png_bytes",
 ):
     if _k not in st.session_state:
         st.session_state[_k] = None
@@ -996,7 +998,7 @@ if "a__puissance" not in st.session_state:
     st.session_state.a__puissance = None
 
 # ── Session state — volet B ───────────────────────────────────────────────────
-for _k in ("b_carte_html", "b_txt_bytes", "b_nom_fichier", "b_n_points", "b_shape", "b_intervalle_courbes"):
+for _k in ("b_carte_html", "b_txt_bytes", "b_nom_fichier", "b_n_points", "b_shape", "b_intervalle_courbes", "b_png_bytes"):
     if _k not in st.session_state:
         st.session_state[_k] = None
 
@@ -1142,6 +1144,7 @@ with onglet_a:
         st.session_state.a_extracting = True
         st.session_state.a_carte_html = None
         st.session_state.a_txt_bytes = None
+        st.session_state.a_png_bytes = None
         st.rerun()
 
     # ── Colonne droite : rendu (calcul + résultats) ───────────────────────────
@@ -1200,7 +1203,7 @@ with onglet_a:
                     if not detecter_resolution_reelle(mnt):
                         resolution_effective = 5
                         st.session_state.a_warning_resolution = (
-                            "Données 1 m de qualité réduite détectée sur cette zone (acquisition photogrammétrique probable — millésime ancien) — "
+                            "Données 1 m non disponibles sur cette zone — "
                             "l'API IGN a retourné du 5 m rééchantillonné (nearest-neighbour). "
                             "La carte affichée correspond à une interpolation de ces données "
                             "à la granularité 1 m. "
@@ -1240,6 +1243,24 @@ with onglet_a:
                     )
                     # Correction bug folium : render() évite le I/O on closed file
                     st.session_state.a_carte_html = carte.get_root().render()
+
+                with st.spinner("Génération de l'export image (PNG/PDF)…"):
+                    try:
+                        st.session_state.a_png_bytes = generer_image_carte(
+                            pentes=pentes,
+                            orientations=orientations,
+                            transform_l93=transform,
+                            gdf_site=gdf,
+                            mnt_brut=mnt,
+                            technologie=st.session_state.a__technologie,
+                            puissance=st.session_state.a__puissance,
+                            logo_path=_logo_path,
+                            dpi=200,
+                            nom_fichier=st.session_state.a__uploaded_name,
+                        )
+                    except Exception as _e_png:
+                        st.session_state.a_png_bytes = None
+                        st.warning(f"Export image indisponible : {_e_png}")
 
                 with st.spinner("Préparation de l'export TXT…"):
                     if _res == 1 and resolution_effective == 5:
@@ -1317,6 +1338,28 @@ with onglet_a:
                     type="primary",
                     key="a_dl_main",
                 )
+
+            if st.session_state.a_png_bytes:
+                _nom_base_a = os.path.splitext(st.session_state.a_nom_fichier or "carte")[0]
+                col_png_a, col_pdf_a = st.columns(2)
+                with col_png_a:
+                    st.download_button(
+                        label="🖼️ Télécharger PNG (carte + seuils)",
+                        data=st.session_state.a_png_bytes,
+                        file_name=f"{_nom_base_a}_carte.png",
+                        mime="image/png",
+                        use_container_width=True,
+                        key="a_dl_png",
+                    )
+                with col_pdf_a:
+                    st.download_button(
+                        label="📄 Télécharger PDF (carte + seuils)",
+                        data=png_vers_pdf(st.session_state.a_png_bytes),
+                        file_name=f"{_nom_base_a}_carte.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="a_dl_pdf",
+                    )
 
             if st.session_state.a_carte_html:
                 st.components.v1.html(
@@ -1491,6 +1534,7 @@ with onglet_b:
         st.session_state.b_extracting = True
         st.session_state.b_carte_html = None
         st.session_state.b_txt_bytes = None
+        st.session_state.b_png_bytes = None
         st.rerun()
 
     # ── Colonne droite : rendu (calcul + résultats) ───────────────────────────
@@ -1593,6 +1637,24 @@ with onglet_b:
                             puissance=st.session_state.b__puissance,
                         )
                         st.session_state.b_carte_html = carte_b.get_root().render()
+
+                    with st.spinner("Génération de l'export image (PNG/PDF)…"):
+                        try:
+                            st.session_state.b_png_bytes = generer_image_carte(
+                                pentes=pentes_b,
+                                orientations=orientations_b,
+                                transform_l93=transform_b,
+                                gdf_site=gdf_site_b,
+                                mnt_brut=mnt_b,
+                                technologie=st.session_state.b__technologie,
+                                puissance=st.session_state.b__puissance,
+                                logo_path=_logo_path,
+                                dpi=200,
+                                nom_fichier=st.session_state.b__uploaded_name,
+                            )
+                        except Exception as _e_png:
+                            st.session_state.b_png_bytes = None
+                            st.warning(f"Export image indisponible : {_e_png}")
                 else:
                     # Mode convert : pipeline court, pas de génération de carte
                     st.session_state.b_carte_html = None
@@ -1647,6 +1709,28 @@ with onglet_b:
                 type="primary",
                 key="b_dl_main",
             )
+
+            if st.session_state.b_png_bytes:
+                _nom_base_b = os.path.splitext(st.session_state.b_nom_fichier or "carte")[0]
+                col_png_b, col_pdf_b = st.columns(2)
+                with col_png_b:
+                    st.download_button(
+                        label="🖼️ Télécharger PNG (carte + seuils)",
+                        data=st.session_state.b_png_bytes,
+                        file_name=f"{_nom_base_b}_carte.png",
+                        mime="image/png",
+                        use_container_width=True,
+                        key="b_dl_png",
+                    )
+                with col_pdf_b:
+                    st.download_button(
+                        label="📄 Télécharger PDF (carte + seuils)",
+                        data=png_vers_pdf(st.session_state.b_png_bytes),
+                        file_name=f"{_nom_base_b}_carte.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="b_dl_pdf",
+                    )
 
             if st.session_state.b_carte_html:
                 st.components.v1.html(

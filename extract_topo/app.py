@@ -8,6 +8,8 @@ import zipfile
 import tempfile
 import json
 import math
+import inspect
+import hashlib
 
 import numpy as np
 import geopandas as gpd
@@ -25,7 +27,24 @@ from scipy.interpolate import griddata as scipy_griddata
 from shapely.geometry import MultiPoint
 from skimage import measure as skimage_measure
 from streamlit_folium import st_folium
-from export_carte import generer_image_carte, png_vers_pdf
+from export_carte import (
+    generer_image_carte,
+    png_vers_pdf,
+    classifier_pente_topo,
+    detecter_zones_planes,
+    resume_zones_planes,
+    MODE_CONSTRUCTIBILITE,
+    MODE_TOPOGRAPHIE,
+    COUCHES,
+    LIBELLES_COUCHES,
+    couches_par_defaut,
+    COULEUR_ZONE_FILL,
+    COULEUR_ZONE_TRAIT,
+    SURFACE_MIN_ZONE,
+    _PALETTE_TOPO,
+    _LABELS_TOPO,
+)
+from affine import Affine
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 _URL_ALTI = "https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json"
@@ -314,11 +333,22 @@ def classifier_pente_orientee(
     return cls
 
 
-def _to_rgba(classes: np.ndarray, opacite: float = 0.65) -> np.ndarray:
+def _hex_to_rgb(couleur_hex: str) -> tuple:
+    h = couleur_hex.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+# Palette du mode topographie, convertie une fois au format {classe: (r, g, b)}
+_PALETTE_TOPO_RGB = {i: _hex_to_rgb(c) for i, c in enumerate(_PALETTE_TOPO)}
+
+
+def _to_rgba(classes: np.ndarray, opacite: float = 0.65, palette: dict = None) -> np.ndarray:
+    if palette is None:
+        palette = _PALETTE
     h, w = classes.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     alpha = int(opacite * 255)
-    for val, (r, g, b) in _PALETTE.items():
+    for val, (r, g, b) in palette.items():
         rgba[classes == val] = [r, g, b, alpha]
     return rgba
 
@@ -375,6 +405,9 @@ def creer_carte(
     mnt_brut: np.ndarray = None,
     technologie: str = "FIXE",
     puissance: str = "<5MWc",
+    mode: str = MODE_CONSTRUCTIBILITE,
+    zones: list = None,
+    couches: dict = None,
 ) -> folium.Map:
     """
     Carte Folium avec :
@@ -383,7 +416,23 @@ def creer_carte(
     - Courbes de niveau calculées depuis mnt_brut (si fourni)
     - Contour jaune pointillé du site (toggleable)
     - Légende fixe des classes
+
+    mode="constructibilite" : classification par (pente, orientation) selon
+        les seuils projet — palette vert/jaune/orange/rouge.
+    mode="topographie" : classification par pente seule, seuils universels
+        <5 / 5-10 / 10-15 / >15 % — palette séquentielle ocre.
+
+    Même sémantique que export_carte.generer_image_carte(). Les deux modes
+    partagent MNT et transform : seule la classification et la palette changent.
+
+    `zones` — liste issue de detecter_zones_planes() (géométries L93). Rendue
+    en couche toggleable, mode topographie uniquement.
+
+    `couches` — dict {nom: bool}. Une couche décochée n'est pas ajoutée à la
+    carte : le même dict est passé à generer_image_carte(), si bien que
+    l'export PNG/PDF montre exactement les couches visibles à l'écran.
     """
+    couches = {**couches_par_defaut(), **(couches or {})}
     gdf_wgs84 = gdf_site.to_crs("EPSG:4326")
     union = gdf_wgs84.union_all()
     centre = [union.centroid.y, union.centroid.x]
@@ -409,22 +458,27 @@ def creer_carte(
         control=True,
     ).add_to(carte)
 
-    # Overlay pentes (zone + buffer)
-    classes = classifier_pente_orientee(pentes, orientations, technologie, puissance)
-    rgba = _to_rgba(classes)
+    # Overlay pentes (zone + buffer) — la classification dépend du mode
+    if mode == MODE_TOPOGRAPHIE:
+        classes = classifier_pente_topo(pentes)
+        rgba = _to_rgba(classes, palette=_PALETTE_TOPO_RGB)
+    else:
+        classes = classifier_pente_orientee(pentes, orientations, technologie, puissance)
+        rgba = _to_rgba(classes)
     rgba_wgs84, bounds_pente = _rgba_l93_to_wgs84(rgba, transform_l93)
 
-    fg = folium.FeatureGroup(name="Pentes", show=True)
-    folium.raster_layers.ImageOverlay(
-        image=f"data:image/png;base64,{_img_b64(rgba_wgs84)}",
-        bounds=bounds_pente,
-        opacity=1.0,
-        interactive=False,
-    ).add_to(fg)
-    fg.add_to(carte)
+    if couches["pentes"]:
+        fg = folium.FeatureGroup(name="Pentes", show=True)
+        folium.raster_layers.ImageOverlay(
+            image=f"data:image/png;base64,{_img_b64(rgba_wgs84)}",
+            bounds=bounds_pente,
+            opacity=1.0,
+            interactive=False,
+        ).add_to(fg)
+        fg.add_to(carte)
 
     # Courbes de niveau (calculées depuis le MNT brut si fourni)
-    if mnt_brut is not None:
+    if couches["courbes"] and mnt_brut is not None:
         courbes, labels_courbes = generer_courbes_niveau(mnt_brut, transform_l93)
         if courbes:
             fg_courbes = folium.FeatureGroup(name="Courbes de niveau", show=True)
@@ -455,21 +509,73 @@ def creer_carte(
             fg_courbes.add_to(carte)
 
     # Contour du shapefile initial — jaune pointillé (toggleable via LayerControl)
-    fg_site = folium.FeatureGroup(name="Contour du site", control=True, show=True)
-    folium.GeoJson(
-        gdf_wgs84.__geo_interface__,
-        style_function=lambda _: {
-            "fillColor": "none",
-            "color": "#FFE600",
-            "weight": 2,
-            "dashArray": "6,4",
-        },
-    ).add_to(fg_site)
-    fg_site.add_to(carte)
+    if couches["contour"]:
+        fg_site = folium.FeatureGroup(name="Contour du site", control=True, show=True)
+        folium.GeoJson(
+            gdf_wgs84.__geo_interface__,
+            style_function=lambda _: {
+                "fillColor": "none",
+                "color": "#FFE600",
+                "weight": 2,
+                "dashArray": "6,4",
+            },
+        ).add_to(fg_site)
+        fg_site.add_to(carte)
+
+    # Zones planes exploitables — mode topographie uniquement.
+    # ATTENTION : doit être ajoutée AVANT LayerControl, sinon la couche
+    # n'apparaît pas dans le panneau de contrôle.
+    if mode == MODE_TOPOGRAPHIE and zones and couches["zones"]:
+        fg_zones = folium.FeatureGroup(name="Zones planes exploitables", show=True)
+        gdf_zones_wgs84 = gpd.GeoDataFrame(
+            geometry=[z["geom"] for z in zones], crs="EPSG:2154"
+        ).to_crs("EPSG:4326")
+        for geom_wgs84, z in zip(gdf_zones_wgs84.geometry, zones):
+            surface_ha = z["surface"] / 10000
+            libelle = (
+                f"{z['surface']:,.0f} m² ({surface_ha:.2f} ha)".replace(",", " ")
+            )
+            # Popup au CLIC, pas tooltip au survol : le survol est déjà occupé
+            # par la boîte pente/orientation (_ajouter_tooltip_hover), et deux
+            # bulles suivant le curseur se superposaient.
+            folium.GeoJson(
+                geom_wgs84.__geo_interface__,
+                style_function=lambda _: {
+                    "fillColor": COULEUR_ZONE_FILL,
+                    "color": COULEUR_ZONE_TRAIT,
+                    "weight": 2,
+                    "fillOpacity": 0.35,
+                },
+                popup=folium.Popup(f"Zone plane — {libelle}", max_width=250),
+            ).add_to(fg_zones)
+
+            # Étiquette permanente au centroïde : lisible sans interaction,
+            # et statique donc jamais en conflit avec la boîte de survol.
+            centre_z = geom_wgs84.representative_point()
+            folium.Marker(
+                location=[centre_z.y, centre_z.x],
+                icon=folium.DivIcon(
+                    html=(
+                        f'<div style="font-size:10px;font-weight:bold;color:#004a75;'
+                        f'text-shadow:1px 1px 0 white,-1px -1px 0 white,'
+                        f'1px -1px 0 white,-1px 1px 0 white;'
+                        f'white-space:nowrap;pointer-events:none;text-align:center;'
+                        f'">{libelle}</div>'
+                    ),
+                    icon_size=(120, 14),
+                    icon_anchor=(60, 7),
+                ),
+            ).add_to(fg_zones)
+        fg_zones.add_to(carte)
 
     folium.LayerControl(position="bottomright", collapsed=False).add_to(carte)
     carte.fit_bounds(site_bounds)
-    _ajouter_legende(carte)
+    _ajouter_legende(
+        carte,
+        mode=mode,
+        avec_zones=bool(zones) and couches["zones"],
+        couches=couches,
+    )
     _ajouter_tooltip_hover(carte, pentes, orientations, transform_l93)
 
     # Logo UNITe — coin supérieur droit de la carte
@@ -482,12 +588,61 @@ def creer_carte(
     return carte
 
 
-def _ajouter_legende(carte: folium.Map) -> None:
+def _ajouter_legende(
+    carte: folium.Map,
+    mode: str = MODE_CONSTRUCTIBILITE,
+    avec_zones: bool = False,
+    couches: dict = None,
+) -> None:
+    couches = {**couches_par_defaut(), **(couches or {})}
     sw = "display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:middle;margin-right:5px"
+
+    if mode == MODE_TOPOGRAPHIE:
+        titre_leg = "Pente du terrain"
+        entrees = list(zip(_PALETTE_TOPO, _LABELS_TOPO))
+    else:
+        titre_leg = "Pente — seuils projet"
+        entrees = [
+            ("#4CAF50", "Favorable"),
+            ("#FFC107", "Acceptable"),
+            ("#FF9800", "Contraignant"),
+            ("#F44336", "Exclusion possible"),
+        ]
+
+    # La légende ne liste que les couches réellement présentes sur la carte
+    if not couches["pentes"]:
+        entrees = []
+        titre_leg = "Légende"
+    lignes = "".join(
+        f'<span style="background:{couleur};{sw}"></span>{libelle}<br>'
+        for couleur, libelle in entrees
+    )
+    if avec_zones:
+        lignes += (
+            f'<span style="background:{COULEUR_ZONE_FILL};opacity:.55;'
+            f'border:1px solid {COULEUR_ZONE_TRAIT};{sw}"></span>'
+            f'Zone plane exploitable<br>'
+        )
+
+    # Séparateur + contour : uniquement si la couche est affichée
+    bloc_contour = (
+        '<hr style="margin:7px 0;border:none;border-top:1px solid #e0e0e0">'
+        '<div style="display:flex;align-items:center;gap:6px">'
+        '<span style="display:inline-block;width:20px;height:0;'
+        'border-top:2px dashed #FFE600;flex-shrink:0"></span>'
+        '<span>Contour du site</span></div>'
+        if couches["contour"] else ""
+    )
+
     html = f"""
 <style>
+/* Empilement en bas à DROITE, de bas en haut :
+     bandeau d'attribution — légende (la plus large) — panneau de couches.
+   Le centre de la carte reste dégagé, et la barre d'échelle en bas à gauche
+   n'est pas recouverte. Les décalages exacts sont posés par le script
+   ci-dessous, qui mesure les hauteurs réelles (elles varient selon le mode). */
 #leg {{
-  position:fixed; right:10px; bottom:160px; z-index:1000;
+  position:fixed; right:10px; bottom:22px; z-index:1000;
   background:white; padding:9px 11px; border-radius:6px;
   font-size:11px; min-width:195px;
   box-shadow:0 1px 5px rgba(0,0,0,.3); color:#212121;
@@ -495,17 +650,35 @@ def _ajouter_legende(carte: folium.Map) -> None:
 .leaflet-control-attribution {{ font-size:8px !important; opacity:.7; }}
 </style>
 <div id="leg">
-  <b>Pente — seuils projet</b><br><br>
-  <span style="background:#4CAF50;{sw}"></span>Favorable<br>
-  <span style="background:#FFC107;{sw}"></span>Acceptable<br>
-  <span style="background:#FF9800;{sw}"></span>Contraignant<br>
-  <span style="background:#F44336;{sw}"></span>Exclusion possible
-  <hr style="margin:7px 0;border:none;border-top:1px solid #e0e0e0">
-  <div style="display:flex;align-items:center;gap:6px">
-    <span style="display:inline-block;width:20px;height:0;border-top:2px dashed #FFE600;flex-shrink:0"></span>
-    <span>Contour du site</span>
-  </div>
+  <b>{titre_leg}</b><br><br>
+  {lignes}
+  {bloc_contour}
 </div>
+<script>
+// Empile bandeau d'attribution / légende / panneau de couches sans
+// chevauchement. Les hauteurs sont MESURÉES et non codées en dur : la légende
+// varie selon le mode (4 ou 5 entrées) et la présence de la ligne
+// « Zone plane exploitable », et le bandeau se replie sur deux lignes
+// lorsque la carte est étroite.
+// La marge est posée sur le seul panneau de couches, pas sur le conteneur
+// bas-droite : sinon le bandeau d'attribution, qui y vit aussi, remonterait
+// avec lui et viendrait s'intercaler entre les deux boîtes.
+(function() {{
+  function placer() {{
+    var leg = document.getElementById('leg');
+    var couches = document.querySelector('.leaflet-control-layers');
+    if (!leg || !couches) {{ setTimeout(placer, 100); return; }}
+    var attribution = document.querySelector('.leaflet-control-attribution');
+    var hAttribution = attribution ? attribution.offsetHeight : 16;
+    // Légende posée juste au-dessus du bandeau, laissé tout en bas
+    leg.style.bottom = (hAttribution + 5) + 'px';
+    // Panneau de couches remonté au-dessus de la légende
+    couches.style.marginBottom = (leg.offsetHeight + 12) + 'px';
+  }}
+  placer();
+  window.addEventListener('resize', placer);
+}})();
+</script>
 """
     carte.get_root().html.add_child(folium.Element(html))
 
@@ -567,6 +740,411 @@ def afficher_tableau_seuils(technologie: str, puissance: str) -> None:
     note_globale = table.get("note_globale")
     if note_globale:
         st.caption(f"ℹ️ {note_globale}")
+
+
+# ── 6b. Sections de résultats : carte + exports PNG/PDF à la demande ─────────
+
+def _slug(texte: str) -> str:
+    """
+    Nom de fichier sûr : accents et caractères interdits sous Windows remplacés.
+    Ex. '≥5MWc' → 'sup5MWc', 'OMBRIÈRES' → 'OMBRIERES'.
+    """
+    remplacements = {
+        "≥": "sup", "≤": "inf", "<": "inf", ">": "sup",
+        "È": "E", "É": "E", "Ê": "E", "À": "A", "Ç": "C",
+        "è": "e", "é": "e", "ê": "e", "à": "a", "ç": "c",
+        "·": "-", "/": "-", "\\": "-", ":": "-",
+        " ": "_", "*": "", "?": "", '"': "", "|": "",
+    }
+    for avant, apres in remplacements.items():
+        texte = texte.replace(avant, apres)
+    return texte
+
+
+# ── Zones planes : détection et carte topo mises en cache ────────────────────
+#
+# Coûts mesurés sur grille 2000×2000 à 1 m (pire cas réaliste) :
+#   détection zones ....... 4,2 à 8,6 s selon les paramètres
+#   courbes de niveau ..... 0,68 s
+#   sérialisation tooltip . 0,42 s (2 Mo de JSON)
+# → ~10 s par recalcul : trop lent pour des sliders en temps réel, d'où le
+#   st.form (bouton « Actualiser les zones ») côté interface.
+#
+# Le hash porte sur le CONTENU des pentes + les deux paramètres : revenir à un
+# couple de valeurs déjà testé est instantané (pas de recalcul, pas de rerender).
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _zones_planes_cached(
+    pentes_bytes: bytes,
+    shape: tuple,
+    dtype_str: str,
+    transform_tuple: tuple,
+    seuil: float,
+    largeur: float,
+) -> list:
+    """Enveloppe cacheable de detecter_zones_planes (arrays → bytes hashables)."""
+    pentes = np.frombuffer(pentes_bytes, dtype=dtype_str).reshape(shape)
+    return detecter_zones_planes(
+        pentes,
+        Affine(*transform_tuple),
+        seuil_pente=seuil,
+        largeur_min=largeur,
+    )
+
+
+def _cle_cache(export: dict) -> tuple:
+    """Fragment de clé de cache commun : contenu des pentes + géoréférencement."""
+    pentes = np.ascontiguousarray(export["pentes"])
+    return (
+        pentes.tobytes(),
+        pentes.shape,
+        pentes.dtype.str,
+        tuple(export["transform"])[:6],
+    )
+
+
+def calculer_zones_planes(export: dict, seuil: float, largeur: float) -> list:
+    """Détection des zones planes pour un jeu de paramètres, avec cache."""
+    pentes_bytes, shape, dtype_str, transform_tuple = _cle_cache(export)
+    return _zones_planes_cached(
+        pentes_bytes, shape, dtype_str, transform_tuple, seuil, largeur
+    )
+
+
+def _version_rendu_carte() -> str:
+    """
+    Empreinte du code qui produit le HTML de la carte.
+
+    Sans elle, @st.cache_data resservirait le HTML rendu par une version
+    antérieure des fonctions de rendu après modification du code : les
+    changements de mise en page (position de la légende, couches…) resteraient
+    invisibles tant que les paramètres de zones ne changent pas.
+    """
+    source = "".join(
+        inspect.getsource(f) for f in (creer_carte, _ajouter_legende)
+    )
+    return hashlib.md5(source.encode("utf-8")).hexdigest()[:12]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _carte_html_cached(
+    _export: dict,
+    cle_contenu: tuple,
+    mode: str,
+    seuil: float,
+    largeur: float,
+    version_rendu: str,
+) -> str:
+    """
+    HTML d'une carte Folium pour un mode et un jeu de paramètres donnés.
+
+    La carte affichée porte TOUJOURS toutes les couches : leur affichage se
+    règle dans le panneau Leaflet, côté navigateur. Le tri des couches pour
+    l'export est une décision distincte, prise au moment du téléchargement.
+
+    `_export` est préfixé d'un underscore : Streamlit ne le hache pas (il
+    contient des arrays non hashables). La clé repose sur `cle_contenu`
+    (contenu des pentes + géoréférencement), le mode et les paramètres de
+    zones — revenir à une combinaison déjà vue est instantané.
+    """
+    zones = (
+        calculer_zones_planes(_export, seuil, largeur)
+        if mode == MODE_TOPOGRAPHIE else None
+    )
+    carte = creer_carte(
+        _export["pentes"], _export["orientations"],
+        _export["transform"], _export["gdf"],
+        mnt_brut=_export["mnt"],
+        technologie=_export["technologie"],
+        puissance=_export["puissance"],
+        mode=mode,
+        zones=zones,
+    )
+    return carte.get_root().render()
+
+
+# Valeurs par défaut des sliders — doivent correspondre à celles des widgets
+SEUIL_ZP_DEFAUT = 3.0
+LARGEUR_ZP_DEFAUT = 20
+
+
+def reinitialiser_exports(volet: str) -> None:
+    """Purge l'état des blocs d'export d'un volet (nouvelle extraction)."""
+    for mode in (MODE_CONSTRUCTIBILITE, MODE_TOPOGRAPHIE):
+        for prefixe in ("png", "panneau", "resume", "sig"):
+            st.session_state[f"{volet}_{prefixe}_{mode}"] = None
+
+
+def preparer_carte(volet: str, mode: str, export: dict) -> tuple:
+    """
+    Assemble une carte pour l'affichage : lit les paramètres de zones depuis
+    session_state, calcule les zones, récupère le HTML (avec cache).
+
+    Retourne (html, zones, (seuil, largeur)).
+    """
+    if mode == MODE_TOPOGRAPHIE:
+        seuil = float(st.session_state.get(f"{volet}_zp_seuil", SEUIL_ZP_DEFAUT))
+        largeur = float(st.session_state.get(f"{volet}_zp_largeur", LARGEUR_ZP_DEFAUT))
+        zones = calculer_zones_planes(export, seuil, largeur)
+    else:
+        seuil, largeur = SEUIL_ZP_DEFAUT, float(LARGEUR_ZP_DEFAUT)
+        zones = None
+
+    html = _carte_html_cached(
+        export, _cle_cache(export), mode, seuil, largeur, _version_rendu_carte()
+    )
+    return html, zones, (seuil, largeur)
+
+
+def afficher_section_carte(
+    volet: str,
+    mode: str,
+    carte_html: str,
+    export: dict,
+    zones: list = None,
+    zones_params: tuple = None,
+) -> None:
+    """
+    Affiche une section de résultat : titre, bloc d'export, carte Folium,
+    et (mode constructibilité seulement) le tableau des seuils.
+
+    `volet` — "a" ou "b", préfixe des clés session_state et des clés widget.
+    `export` — dict portant tout ce qu'il faut pour régénérer l'image :
+        pentes, orientations, transform, mnt, gdf, technologie, puissance,
+        nom_fichier, nom_site.
+
+    L'image PNG/PDF n'est PAS générée à l'extraction : le téléchargement des
+    tuiles contextily prend plusieurs secondes. Elle l'est au clic, puis
+    mémorisée en session_state pour que le second clic soit instantané.
+
+    `zones` / `zones_params` — couche zones planes, mode topographie seulement.
+    """
+    est_constructibilite = mode == MODE_CONSTRUCTIBILITE
+
+    if est_constructibilite:
+        st.markdown("##### 2 · 🏗️ Carte constructibilité")
+        st.caption(
+            "Classification croisée pente × orientation selon les seuils projet."
+        )
+        nom_base = (
+            f"{export['nom_site']}_constructibilite_"
+            f"{_slug(export['technologie'])}_{_slug(export['puissance'])}"
+        )
+    else:
+        st.markdown("##### 1 · ⛰️ Carte topographique")
+        st.caption(
+            "Pente brute du terrain, toutes orientations confondues — "
+            "seuils universels < 5 / 5–10 / 10–15 / > 15 %."
+        )
+        nom_base = f"{export['nom_site']}_topographie"
+
+    _afficher_bloc_export(volet, mode, export, nom_base, zones, zones_params)
+
+    if carte_html:
+        st.components.v1.html(carte_html, height=580, scrolling=False)
+
+    if est_constructibilite:
+        afficher_tableau_seuils(export["technologie"], export["puissance"])
+    else:
+        _afficher_sliders_zones(volet, zones)
+
+
+def _afficher_bloc_export(
+    volet: str,
+    mode: str,
+    export: dict,
+    nom_base: str,
+    zones: list,
+    zones_params: tuple,
+) -> None:
+    """
+    Bloc d'export en trois états successifs :
+
+      1. bouton « Générer l'export PNG / PDF »
+      2. choix des couches à conserver, puis confirmation
+      3. boutons de téléchargement + retour possible à l'étape 2
+
+    Le choix des couches n'apparaît qu'à l'étape 2 : il ne concerne que le
+    fichier produit. L'affichage à l'écran, lui, se règle dans le panneau de
+    couches de la carte — deux jeux de cases visibles en permanence prêtaient
+    à confusion.
+
+    Ces cases sont indispensables côté Streamlit : le panneau Leaflet vit dans
+    l'iframe et son état n'est pas lisible par le serveur, qui ne saurait donc
+    pas quoi dessiner dans le PNG/PDF.
+    """
+    cle_png = f"{volet}_png_{mode}"
+    cle_panneau = f"{volet}_panneau_{mode}"
+    cle_resume = f"{volet}_resume_{mode}"
+    for cle in (cle_png, cle_panneau, cle_resume):
+        if cle not in st.session_state:
+            st.session_state[cle] = None
+
+    # Un changement des paramètres de zones périme le fichier déjà produit :
+    # sans ça, le téléchargement livrerait les zones de la version précédente.
+    cle_sig = f"{volet}_sig_{mode}"
+    if st.session_state.get(cle_sig) != zones_params:
+        st.session_state[cle_png] = None
+        st.session_state[cle_resume] = None
+        st.session_state[cle_sig] = zones_params
+
+    noms = [n for n in COUCHES if n != "zones" or mode == MODE_TOPOGRAPHIE]
+
+    # ── État 2 : sélection des couches ───────────────────────────────────────
+    if st.session_state[cle_panneau]:
+        with st.container(border=True):
+            st.markdown("**Couches à conserver pour le téléchargement**")
+            # La valeur retournée par le widget est lue directement : elle est
+            # à jour dès le run déclenché par le clic sur « Générer ».
+            choix = {}
+            colonnes = st.columns(len(noms))
+            for colonne, nom in zip(colonnes, noms):
+                with colonne:
+                    choix[nom] = st.checkbox(
+                        LIBELLES_COUCHES[nom],
+                        value=True,
+                        key=f"{volet}_exp_{nom}_{mode}",
+                    )
+            col_ok, col_annul = st.columns([2, 1])
+            with col_ok:
+                valider = st.button(
+                    "✅ Générer le fichier",
+                    key=f"{volet}_ok_{mode}",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with col_annul:
+                annuler = st.button(
+                    "Annuler",
+                    key=f"{volet}_annul_{mode}",
+                    use_container_width=True,
+                )
+
+        if annuler:
+            st.session_state[cle_panneau] = False
+            st.rerun()
+
+        if valider:
+            # Les couches absentes du mode (zones hors topographie) restent à
+            # True : elles ne sont de toute façon pas dessinées.
+            couches = {nom: bool(choix.get(nom, True)) for nom in COUCHES}
+            try:
+                with st.spinner(
+                    "Génération de l'image — téléchargement des tuiles satellite…"
+                ):
+                    st.session_state[cle_png] = generer_image_carte(
+                        pentes=export["pentes"],
+                        orientations=export["orientations"],
+                        transform_l93=export["transform"],
+                        gdf_site=export["gdf"],
+                        mnt_brut=export["mnt"],
+                        technologie=export["technologie"],
+                        puissance=export["puissance"],
+                        dpi=200,
+                        nom_fichier=export["nom_fichier"],
+                        mode=mode,
+                        zones_planes=zones,
+                        zones_params=zones_params,
+                        couches=couches,
+                    )
+                retenues = [LIBELLES_COUCHES[n] for n in noms if couches[n]]
+                st.session_state[cle_resume] = (
+                    ", ".join(retenues) if retenues else "fond satellite seul"
+                )
+                st.session_state[cle_panneau] = False
+                st.rerun()
+            except Exception as e:
+                st.warning(f"Export image indisponible : {e}")
+        return
+
+    # ── État 3 : fichier prêt ────────────────────────────────────────────────
+    if st.session_state[cle_png]:
+        col_png, col_pdf = st.columns(2)
+        with col_png:
+            st.download_button(
+                label="🖼️ Télécharger PNG",
+                data=st.session_state[cle_png],
+                file_name=f"{nom_base}.png",
+                mime="image/png",
+                use_container_width=True,
+                key=f"{volet}_dl_png_{mode}",
+            )
+        with col_pdf:
+            st.download_button(
+                label="📄 Télécharger PDF",
+                data=png_vers_pdf(st.session_state[cle_png]),
+                file_name=f"{nom_base}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"{volet}_dl_pdf_{mode}",
+            )
+        st.caption(f"Couches incluses : {st.session_state[cle_resume]}.")
+        if st.button(
+            "↻ Régénérer avec d'autres couches",
+            key=f"{volet}_regen_{mode}",
+            use_container_width=True,
+        ):
+            st.session_state[cle_panneau] = True
+            st.rerun()
+        return
+
+    # ── État 1 : point de départ ─────────────────────────────────────────────
+    if st.button(
+        "🖼️ Générer l'export PNG / PDF",
+        key=f"{volet}_gen_{mode}",
+        use_container_width=True,
+    ):
+        st.session_state[cle_panneau] = True
+        st.rerun()
+
+
+def _afficher_sliders_zones(volet: str, zones: list) -> None:
+    """
+    Sliders de paramétrage des zones planes, sous la carte topographique.
+
+    Dans un st.form : le recalcul complet (détection + reconstruction de la
+    carte Folium) atteint ~10 s sur un site 1 m de grande emprise, ce qui rend
+    des sliders en temps réel inutilisables. La validation explicite déclenche
+    un seul rerun au lieu d'un par cran de slider.
+    """
+    st.markdown("**Zones planes exploitables** — base vie, stockage")
+
+    with st.form(key=f"{volet}_zp_form"):
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.slider(
+                "Pente maximale", 1.0, 8.0, 3.0, 0.5,
+                format="%.1f %%",
+                key=f"{volet}_zp_seuil",
+                help=(
+                    "3 % : base vie, modulaires, parking. "
+                    "5 % : stockage, circulation PL. "
+                    "Au-delà, terrassement nécessaire."
+                ),
+            )
+        with col_s2:
+            st.slider(
+                "Largeur minimale", 10, 40, 20, 5,
+                format="%d m",
+                key=f"{volet}_zp_largeur",
+                help=(
+                    "Largeur utile en tout point de la zone. Élimine les bandes "
+                    "étroites qui suivent les courbes de niveau."
+                ),
+            )
+        st.form_submit_button(
+            "🔄 Actualiser les zones", use_container_width=True
+        )
+
+    if zones:
+        st.success(resume_zones_planes(zones))
+    else:
+        st.info(resume_zones_planes(zones or []))
+    st.caption(
+        f"Surface minimale retenue : {SURFACE_MIN_ZONE:,.0f} m².".replace(",", " ")
+        + " Détection sur le MNT lissé — les zones sont indicatives, à confirmer "
+        "par un relevé terrain."
+    )
 
 
 # ── 7. Tooltip hover pente / orientation ─────────────────────────────────────
@@ -977,10 +1555,12 @@ st.divider()
 
 # ── Session state — volet A ───────────────────────────────────────────────────
 for _k in (
-    "a_carte_html", "a_txt_bytes", "a_nom_fichier", "a_intervalle_courbes",
+    "a_txt_bytes", "a_nom_fichier", "a_intervalle_courbes",
     "a_txt_bytes_interp", "a_nom_fichier_interp",
     "a_resolution_effective", "a_warning_resolution",
-    "a_png_bytes",
+    # Données de réexport ; les HTML de cartes viennent de _carte_html_cached
+    "a_export",
+    f"a_png_{MODE_CONSTRUCTIBILITE}", f"a_png_{MODE_TOPOGRAPHIE}",
 ):
     if _k not in st.session_state:
         st.session_state[_k] = None
@@ -998,7 +1578,11 @@ if "a__puissance" not in st.session_state:
     st.session_state.a__puissance = None
 
 # ── Session state — volet B ───────────────────────────────────────────────────
-for _k in ("b_carte_html", "b_txt_bytes", "b_nom_fichier", "b_n_points", "b_shape", "b_intervalle_courbes", "b_png_bytes"):
+for _k in (
+    "b_txt_bytes", "b_nom_fichier", "b_n_points", "b_shape",
+    "b_intervalle_courbes", "b_export",
+    f"b_png_{MODE_CONSTRUCTIBILITE}", f"b_png_{MODE_TOPOGRAPHIE}",
+):
     if _k not in st.session_state:
         st.session_state[_k] = None
 
@@ -1142,9 +1726,9 @@ with onglet_a:
         st.session_state.a__technologie = technologie_a
         st.session_state.a__puissance = puissance_a
         st.session_state.a_extracting = True
-        st.session_state.a_carte_html = None
         st.session_state.a_txt_bytes = None
-        st.session_state.a_png_bytes = None
+        st.session_state.a_export = None
+        reinitialiser_exports("a")
         st.rerun()
 
     # ── Colonne droite : rendu (calcul + résultats) ───────────────────────────
@@ -1229,38 +1813,29 @@ with onglet_a:
                         mnt_affichage = mnt
                     pentes, orientations = calculer_pentes_et_orientation(mnt_affichage, transform)
 
-                with st.spinner("Génération de la carte…"):
-                    # mnt = MNT brut (non lissé) — utilisé pour les courbes de niveau
-                    _z_min_a = float(np.nanmin(mnt))
-                    _z_max_a = float(np.nanmax(mnt))
-                    _intervalle_a = max(1, round((_z_max_a - _z_min_a) / 20))
-                    st.session_state.a_intervalle_courbes = _intervalle_a
-                    carte = creer_carte(
-                        pentes, orientations, transform, gdf,
-                        mnt_brut=mnt,
-                        technologie=st.session_state.a__technologie,
-                        puissance=st.session_state.a__puissance,
-                    )
-                    # Correction bug folium : render() évite le I/O on closed file
-                    st.session_state.a_carte_html = carte.get_root().render()
+                # mnt = MNT brut (non lissé) — utilisé pour les courbes de niveau
+                _z_min_a = float(np.nanmin(mnt))
+                _z_max_a = float(np.nanmax(mnt))
+                st.session_state.a_intervalle_courbes = max(
+                    1, round((_z_max_a - _z_min_a) / 20)
+                )
+                # Les deux cartes dépendent de l'état des couches (et des
+                # paramètres de zones pour la topographique) : elles sont
+                # produites à l'affichage par _carte_html_cached(), qui les
+                # mémorise pour chaque combinaison.
 
-                with st.spinner("Génération de l'export image (PNG/PDF)…"):
-                    try:
-                        st.session_state.a_png_bytes = generer_image_carte(
-                            pentes=pentes,
-                            orientations=orientations,
-                            transform_l93=transform,
-                            gdf_site=gdf,
-                            mnt_brut=mnt,
-                            technologie=st.session_state.a__technologie,
-                            puissance=st.session_state.a__puissance,
-                            logo_path=_logo_path,
-                            dpi=200,
-                            nom_fichier=st.session_state.a__uploaded_name,
-                        )
-                    except Exception as _e_png:
-                        st.session_state.a_png_bytes = None
-                        st.warning(f"Export image indisponible : {_e_png}")
+                # Données conservées pour régénérer les PNG/PDF à la demande
+                st.session_state.a_export = {
+                    "pentes": pentes,
+                    "orientations": orientations,
+                    "transform": transform,
+                    "mnt": mnt,
+                    "gdf": gdf,
+                    "technologie": st.session_state.a__technologie,
+                    "puissance": st.session_state.a__puissance,
+                    "nom_fichier": st.session_state.a__uploaded_name,
+                    "nom_site": nom_shp,
+                }
 
                 with st.spinner("Préparation de l'export TXT…"):
                     if _res == 1 and resolution_effective == 5:
@@ -1339,35 +1914,30 @@ with onglet_a:
                     key="a_dl_main",
                 )
 
-            if st.session_state.a_png_bytes:
-                _nom_base_a = os.path.splitext(st.session_state.a_nom_fichier or "carte")[0]
-                col_png_a, col_pdf_a = st.columns(2)
-                with col_png_a:
-                    st.download_button(
-                        label="🖼️ Télécharger PNG (carte + seuils)",
-                        data=st.session_state.a_png_bytes,
-                        file_name=f"{_nom_base_a}_carte.png",
-                        mime="image/png",
-                        use_container_width=True,
-                        key="a_dl_png",
-                    )
-                with col_pdf_a:
-                    st.download_button(
-                        label="📄 Télécharger PDF (carte + seuils)",
-                        data=png_vers_pdf(st.session_state.a_png_bytes),
-                        file_name=f"{_nom_base_a}_carte.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                        key="a_dl_pdf",
-                    )
-
-            if st.session_state.a_carte_html:
-                st.components.v1.html(
-                    st.session_state.a_carte_html, height=580, scrolling=False
+            if st.session_state.a_export:
+                # 1 · topographie (avec zones planes paramétrables)
+                st.divider()
+                _html_a, _zones_a, _params_a = preparer_carte(
+                    "a", MODE_TOPOGRAPHIE, st.session_state.a_export
                 )
-                afficher_tableau_seuils(
-                    st.session_state.a__technologie or "FIXE",
-                    st.session_state.a__puissance or "<5MWc",
+                afficher_section_carte(
+                    volet="a",
+                    mode=MODE_TOPOGRAPHIE,
+                    carte_html=_html_a,
+                    export=st.session_state.a_export,
+                    zones=_zones_a,
+                    zones_params=_params_a,
+                )
+                # 2 · constructibilité
+                st.divider()
+                _html_ca, _, _ = preparer_carte(
+                    "a", MODE_CONSTRUCTIBILITE, st.session_state.a_export
+                )
+                afficher_section_carte(
+                    volet="a",
+                    mode=MODE_CONSTRUCTIBILITE,
+                    carte_html=_html_ca,
+                    export=st.session_state.a_export,
                 )
 
 
@@ -1532,9 +2102,9 @@ with onglet_b:
         st.session_state.b__technologie = technologie_b
         st.session_state.b__puissance = puissance_b
         st.session_state.b_extracting = True
-        st.session_state.b_carte_html = None
         st.session_state.b_txt_bytes = None
-        st.session_state.b_png_bytes = None
+        st.session_state.b_export = None
+        reinitialiser_exports("b")
         st.rerun()
 
     # ── Colonne droite : rendu (calcul + résultats) ───────────────────────────
@@ -1625,39 +2195,29 @@ with onglet_b:
                             mnt_affichage_b, transform_b
                         )
 
-                    with st.spinner("Génération de la carte…"):
-                        _z_min_b = float(np.nanmin(mnt_b))
-                        _z_max_b = float(np.nanmax(mnt_b))
-                        _intervalle_b = max(1, round((_z_max_b - _z_min_b) / 20))
-                        st.session_state.b_intervalle_courbes = _intervalle_b
-                        carte_b = creer_carte(
-                            pentes_b, orientations_b, transform_b, gdf_site_b,
-                            mnt_brut=mnt_b,
-                            technologie=st.session_state.b__technologie,
-                            puissance=st.session_state.b__puissance,
-                        )
-                        st.session_state.b_carte_html = carte_b.get_root().render()
+                    _z_min_b = float(np.nanmin(mnt_b))
+                    _z_max_b = float(np.nanmax(mnt_b))
+                    st.session_state.b_intervalle_courbes = max(
+                        1, round((_z_max_b - _z_min_b) / 20)
+                    )
+                    # Cartes produites à l'affichage (avec cache) : elles
+                    # dépendent de l'état des couches et des zones.
 
-                    with st.spinner("Génération de l'export image (PNG/PDF)…"):
-                        try:
-                            st.session_state.b_png_bytes = generer_image_carte(
-                                pentes=pentes_b,
-                                orientations=orientations_b,
-                                transform_l93=transform_b,
-                                gdf_site=gdf_site_b,
-                                mnt_brut=mnt_b,
-                                technologie=st.session_state.b__technologie,
-                                puissance=st.session_state.b__puissance,
-                                logo_path=_logo_path,
-                                dpi=200,
-                                nom_fichier=st.session_state.b__uploaded_name,
-                            )
-                        except Exception as _e_png:
-                            st.session_state.b_png_bytes = None
-                            st.warning(f"Export image indisponible : {_e_png}")
+                    # Données conservées pour régénérer les PNG/PDF à la demande
+                    st.session_state.b_export = {
+                        "pentes": pentes_b,
+                        "orientations": orientations_b,
+                        "transform": transform_b,
+                        "mnt": mnt_b,
+                        "gdf": gdf_site_b,
+                        "technologie": st.session_state.b__technologie,
+                        "puissance": st.session_state.b__puissance,
+                        "nom_fichier": st.session_state.b__uploaded_name,
+                        "nom_site": nom_source,
+                    }
                 else:
                     # Mode convert : pipeline court, pas de génération de carte
-                    st.session_state.b_carte_html = None
+                    st.session_state.b_export = None
                     st.session_state.b_intervalle_courbes = None
 
                 with st.spinner("Préparation de l'export TXT…"):
@@ -1710,34 +2270,28 @@ with onglet_b:
                 key="b_dl_main",
             )
 
-            if st.session_state.b_png_bytes:
-                _nom_base_b = os.path.splitext(st.session_state.b_nom_fichier or "carte")[0]
-                col_png_b, col_pdf_b = st.columns(2)
-                with col_png_b:
-                    st.download_button(
-                        label="🖼️ Télécharger PNG (carte + seuils)",
-                        data=st.session_state.b_png_bytes,
-                        file_name=f"{_nom_base_b}_carte.png",
-                        mime="image/png",
-                        use_container_width=True,
-                        key="b_dl_png",
-                    )
-                with col_pdf_b:
-                    st.download_button(
-                        label="📄 Télécharger PDF (carte + seuils)",
-                        data=png_vers_pdf(st.session_state.b_png_bytes),
-                        file_name=f"{_nom_base_b}_carte.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                        key="b_dl_pdf",
-                    )
-
-            if st.session_state.b_carte_html:
-                st.components.v1.html(
-                    st.session_state.b_carte_html, height=580, scrolling=False
+            if st.session_state.b_export:
+                # 1 · topographie (avec zones planes paramétrables)
+                st.divider()
+                _html_b, _zones_b, _params_b = preparer_carte(
+                    "b", MODE_TOPOGRAPHIE, st.session_state.b_export
                 )
-                if st.session_state.b__technologie and st.session_state.b__puissance:
-                    afficher_tableau_seuils(
-                        st.session_state.b__technologie,
-                        st.session_state.b__puissance,
-                    )
+                afficher_section_carte(
+                    volet="b",
+                    mode=MODE_TOPOGRAPHIE,
+                    carte_html=_html_b,
+                    export=st.session_state.b_export,
+                    zones=_zones_b,
+                    zones_params=_params_b,
+                )
+                # 2 · constructibilité
+                st.divider()
+                _html_cb, _, _ = preparer_carte(
+                    "b", MODE_CONSTRUCTIBILITE, st.session_state.b_export
+                )
+                afficher_section_carte(
+                    volet="b",
+                    mode=MODE_CONSTRUCTIBILITE,
+                    carte_html=_html_cb,
+                    export=st.session_state.b_export,
+                )

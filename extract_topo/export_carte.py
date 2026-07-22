@@ -390,24 +390,36 @@ def generer_image_carte(
     site_geoms_3857 = list(gdf_3857.geometry)
 
     # ── 2. Figure avec deux sous-graphes : carte (haut) + tableau (bas) ──────
-    # Proportions : carte occupe ~80 % de la hauteur, tableau ~20 %
-    fig = plt.figure(figsize=(12, 11), dpi=dpi)
+    # La largeur de la carte est fixe (12 po) ; la hauteur est calculée depuis
+    # le ratio géographique du raster en 3857 pour éviter toute déformation.
+    MAP_W_IN = 12.0
+    TABLE_H_IN = 2.5
+    TITLE_H_IN = 0.35
+
+    geo_ratio = (rx1 - rx0) / max(ry1 - ry0, 1)  # largeur / hauteur en mètres
+    map_h_in = MAP_W_IN / geo_ratio
+    fig_h_in = map_h_in + TABLE_H_IN + TITLE_H_IN
+
+    fig = plt.figure(figsize=(MAP_W_IN, fig_h_in), dpi=dpi)
 
     # Titre en haut (nom du fichier source)
     if nom_fichier:
         nom_base = os.path.splitext(os.path.basename(nom_fichier))[0]
         titre_fig = f"Extraction Topo RGE ALTI IGN — {nom_base}"
         fig.suptitle(titre_fig, fontsize=11, fontweight="bold", y=0.995, va="top")
-        top_margin = 0.965
-    else:
-        top_margin = 0.97
+
+    # Marges exprimées en fraction de la hauteur totale
+    title_frac  = TITLE_H_IN / fig_h_in
+    table_frac  = TABLE_H_IN / fig_h_in
+    top_margin  = 1.0 - title_frac
+    bottom_margin = 0.01
 
     gs = fig.add_gridspec(
         2, 1,
-        height_ratios=[8, 2],
-        hspace=0.05,
+        height_ratios=[map_h_in, TABLE_H_IN],
+        hspace=0.04,
         left=0.01, right=0.99,
-        top=top_margin, bottom=0.01,
+        top=top_margin, bottom=bottom_margin,
     )
     ax_carte = fig.add_subplot(gs[0])
     ax_table = fig.add_subplot(gs[1])

@@ -27,9 +27,11 @@ from rasterio.transform import from_bounds as rt_from_bounds
 from rasterio.crs import CRS
 import rasterio.warp
 from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy.ndimage import binary_opening, label as ndi_label
 from skimage import measure as skimage_measure
+from rasterio.features import shapes as rio_shapes
 import geopandas as gpd
-from shapely.geometry import box
+from shapely.geometry import box, shape as shapely_shape
 
 try:
     import contextily as cx
@@ -52,6 +54,30 @@ _PALETTE = {
     2: (255, 152, 0),    # orange — Contraignant
     3: (244, 67, 54),    # rouge  — Exclusion possible
 }
+
+# ── Mode topographie : pente seule, seuils universels, palette séquentielle ocre
+_SEUILS_TOPO = [5, 10, 15]  # %
+_PALETTE_TOPO = ["#f2e6c9", "#d9b166", "#a8763a", "#6b3f1d"]
+_LABELS_TOPO = ["< 5 %", "5 – 10 %", "10 – 15 %", "> 15 %"]
+
+# Modes de rendu acceptés par generer_image_carte() / creer_carte()
+MODE_CONSTRUCTIBILITE = "constructibilite"
+MODE_TOPOGRAPHIE = "topographie"
+
+# Couches optionnelles, communes au rendu Folium et à l'export matplotlib.
+# La couche "zones" n'existe qu'en mode topographie.
+COUCHES = ("pentes", "courbes", "contour", "zones")
+LIBELLES_COUCHES = {
+    "pentes":  "Pentes",
+    "courbes": "Courbes de niveau",
+    "contour": "Contour du site",
+    "zones":   "Zones planes",
+}
+
+
+def couches_par_defaut() -> dict:
+    """Toutes les couches actives — état initial des deux cartes."""
+    return {nom: True for nom in COUCHES}
 
 _SEUILS = {
     ("FIXE", "<5MWc"): {
@@ -137,13 +163,154 @@ def _classifier_pente_orientee(
     return cls
 
 
-def _to_rgba(classes: np.ndarray, alpha: int = 166) -> np.ndarray:
-    """alpha=166 ≈ 0.65 × 255."""
+def classifier_pente_topo(pentes: np.ndarray) -> np.ndarray:
+    """
+    Classification par pente seule — seuils universels _SEUILS_TOPO.
+    Ignore orientation / technologie / puissance.
+    Retourne array uint8 0–3 / 255 pour NaN.
+
+    Publique : app-3.py l'utilise pour la carte Folium en mode topographie,
+    afin que les deux rendus (Folium et matplotlib) partagent la classification.
+    """
+    cls = np.full(pentes.shape, 255, dtype=np.uint8)
+    valid = ~np.isnan(pentes)
+    cls[valid] = np.digitize(pentes[valid], _SEUILS_TOPO).astype(np.uint8)
+    return cls
+
+
+def _hex_to_rgb(couleur_hex: str) -> tuple[int, int, int]:
+    h = couleur_hex.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _to_rgba(
+    classes: np.ndarray,
+    palette: dict | None = None,
+    alpha: int = 166,
+) -> np.ndarray:
+    """
+    alpha=166 ≈ 0.65 × 255.
+    palette : dict {classe: (r, g, b)} — _PALETTE (constructibilité) par défaut.
+    """
+    if palette is None:
+        palette = _PALETTE
     h, w = classes.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    for val, (r, g, b) in _PALETTE.items():
+    for val, (r, g, b) in palette.items():
         rgba[classes == val] = [r, g, b, alpha]
     return rgba
+
+
+# ── Détection des zones planes exploitables ──────────────────────────────────
+
+# Couleurs de la couche « zones planes » — partagées Folium / matplotlib
+COULEUR_ZONE_FILL = "#00BFFF"
+COULEUR_ZONE_TRAIT = "#0080FF"
+
+# Surface minimale par défaut (m²) — constante, non exposée en slider
+SURFACE_MIN_ZONE = 1000.0
+
+
+def detecter_zones_planes(
+    pentes: np.ndarray,
+    transform_l93,
+    seuil_pente: float = 3.0,      # %
+    largeur_min: float = 20.0,     # m
+    surface_min: float = SURFACE_MIN_ZONE,   # m²
+) -> list:
+    """
+    Détecte les zones suffisamment planes ET suffisamment larges pour
+    accueillir une base vie ou une aire de stockage.
+
+    Retourne une liste de dicts :
+        {"geom": <shapely Polygon en L93>,
+         "surface": <float m², surface RÉELLE après ouverture>}
+
+    Méthode :
+      1. Masque binaire pentes < seuil
+      2. Ouverture morphologique raster (nettoie les pixels isolés)
+      3. Labelling des composantes connexes
+      4. Vectorisation
+      5. Ouverture morphologique géométrique : buffer(-l/2).buffer(+l/2)
+         → ne conserve que les parties où un disque de `largeur_min`
+           de diamètre tient. Élimine les rubans et liserés, quelle que
+           soit la forme globale de la zone (contrairement à un critère
+           de rectangle englobant, qui laisse passer les croissants et
+           rejette à tort les zones en L).
+      6. Filtre sur la surface de la zone OUVERTE (pas la zone brute)
+
+    IMPORTANT : appeler sur les pentes calculées depuis le MNT LISSÉ.
+    Sur MNT brut, le bruit fragmente les zones et rend le résultat instable.
+    """
+    # 1-2. Masque + ouverture raster
+    # errstate : la comparaison NaN < seuil est volontaire (donne False),
+    # on évite juste le RuntimeWarning associé.
+    with np.errstate(invalid="ignore"):
+        masque = (~np.isnan(pentes)) & (pentes < seuil_pente)
+    # structure 3x3 : retire les pixels isolés et les fils d'un pixel
+    masque = binary_opening(masque, structure=np.ones((3, 3)))
+
+    # 3. Composantes connexes
+    labels, n = ndi_label(masque)
+    if n == 0:
+        return []
+
+    # 4. Vectorisation (une passe sur le raster labellisé)
+    zones = []
+    r = largeur_min / 2.0
+    for geom_json, val in rio_shapes(
+        labels.astype(np.int32),
+        mask=(labels > 0),
+        transform=transform_l93,
+    ):
+        poly = shapely_shape(geom_json)
+        if poly.area < surface_min:
+            continue  # pré-filtre rapide avant l'opération coûteuse
+
+        # 5. Ouverture géométrique
+        ouverte = poly.buffer(-r).buffer(r)
+        if ouverte.is_empty:
+            continue
+
+        # 6. Filtre surface sur la géométrie ouverte
+        # (multipolygon possible : une zone en haltère peut donner 2 lobes)
+        parts = ouverte.geoms if ouverte.geom_type == "MultiPolygon" else [ouverte]
+        for part in parts:
+            if part.area >= surface_min:
+                zones.append({"geom": part, "surface": float(part.area)})
+
+    # Tri par surface décroissante (les plus grandes d'abord)
+    zones.sort(key=lambda z: -z["surface"])
+    return zones
+
+
+def libelle_zones_planes(
+    seuil_pente: float,
+    largeur_min: float,
+    surface_min: float = SURFACE_MIN_ZONE,
+) -> str:
+    """Ligne de légende décrivant les paramètres actifs de détection."""
+    return (
+        f"Zones planes : pente < {seuil_pente:.1f} % · "
+        f"largeur ≥ {largeur_min:.0f} m · "
+        f"surface ≥ {surface_min:,.0f} m²".replace(",", " ")
+    )
+
+
+def resume_zones_planes(zones: list) -> str:
+    """
+    Récapitulatif texte des zones détectées, pour affichage sous les sliders.
+    """
+    if not zones:
+        return (
+            "Aucune zone ne satisfait ces critères. Essayer d'augmenter la pente "
+            "maximale ou de réduire la largeur minimale."
+        )
+    surfaces = ", ".join(
+        f"{z['surface']:,.0f} m²".replace(",", " ") for z in zones
+    )
+    pluriel = "s" if len(zones) > 1 else ""
+    return f"{len(zones)} zone{pluriel} détectée{pluriel} : {surfaces}"
 
 
 def _reproject_rgba_to_3857(
@@ -346,34 +513,72 @@ def generer_image_carte(
     dpi: int = 200,
     avec_courbes: bool = True,
     nom_fichier: str | None = None,
+    mode: str = MODE_CONSTRUCTIBILITE,
+    zones_planes: list | None = None,
+    zones_params: tuple | None = None,
+    couches: dict | None = None,
 ) -> bytes:
     """
-    Génère la carte statique PNG (carte + tableau des seuils).
+    Génère la carte statique PNG.
+
+    mode="constructibilite" : classification par (pente, orientation) selon
+        les seuils projet — palette vert/jaune/orange/rouge. Le tableau des
+        seuils par orientation est intégré sous la carte (même figure).
+    mode="topographie" : classification par pente seule, seuils universels
+        <5 / 5-10 / 10-15 / >15 % — palette séquentielle ocre. Pas de tableau :
+        la légende suffit (les seuils par orientation n'ont pas de sens ici).
+
+    zones_planes / zones_params : couche « zones planes exploitables », rendue
+        en mode topographie uniquement. zones_params = (seuil_pente, largeur_min)
+        alimente la ligne de légende décrivant les critères actifs.
+
+    couches : dict {nom: bool} parmi COUCHES. Une couche désactivée n'est ni
+        dessinée ni mentionnée en légende — l'export reflète alors exactement
+        ce que l'utilisateur a coché à l'écran. Toutes actives par défaut.
 
     Travaille entièrement en EPSG:3857 (Web Mercator) car contextily l'exige
-    pour le fond satellite. Le tableau des seuils est intégré dans la même figure
-    (Option A recommandée : un seul fichier, idéal pour le PDF).
+    pour le fond satellite.
 
     Retourne les bytes PNG.
     """
     import matplotlib.patheffects as pe
 
+    if mode not in (MODE_CONSTRUCTIBILITE, MODE_TOPOGRAPHIE):
+        raise ValueError(
+            f"mode inconnu : {mode!r} "
+            f"(attendu {MODE_CONSTRUCTIBILITE!r} ou {MODE_TOPOGRAPHIE!r})"
+        )
+    avec_tableau = mode == MODE_CONSTRUCTIBILITE
+
+    couches = {**couches_par_defaut(), **(couches or {})}
+
     # ── 1. Reprojections en EPSG:3857 ────────────────────────────────────────
     gdf_3857 = gdf_site.to_crs("EPSG:3857")
-    union_3857 = gdf_3857.union_all()
-    b = union_3857.bounds                  # (xmin, ymin, xmax, ymax) en 3857
-    site_bounds_3857 = b
 
-    # Raster RGBA pentes → 3857
-    classes = _classifier_pente_orientee(pentes, orientations, technologie, puissance)
-    rgba = _to_rgba(classes)
+    # Raster RGBA pentes → 3857 — la classification dépend du mode
+    if mode == MODE_CONSTRUCTIBILITE:
+        classes = _classifier_pente_orientee(
+            pentes, orientations, technologie, puissance
+        )
+        palette = _PALETTE
+    else:
+        classes = classifier_pente_topo(pentes)
+        palette = {i: _hex_to_rgb(c) for i, c in enumerate(_PALETTE_TOPO)}
+
+    rgba = _to_rgba(classes, palette=palette)
     rgba_3857, raster_bounds_3857 = _reproject_rgba_to_3857(rgba, transform_l93)
     rx0, ry0, rx1, ry1 = raster_bounds_3857
+
+    # ── 1b. Emprise affichée : raster élargi d'une marge, pour que le contour
+    #        du site ne touche jamais les bords de l'image ──────────────────
+    MARGE = 0.07  # 7 % de la plus grande dimension
+    delta = max(rx1 - rx0, ry1 - ry0) * MARGE
+    vx0, vy0, vx1, vy1 = rx0 - delta, ry0 - delta, rx1 + delta, ry1 + delta
 
     # Courbes de niveau en L93, puis reprojection des coordonnées vers 3857
     courbes_features: list = []
     courbes_labels: list = []
-    if avec_courbes and mnt_brut is not None:
+    if avec_courbes and couches["courbes"] and mnt_brut is not None:
         courbes_l93, labels_l93, _ = _generer_courbes_l93(mnt_brut, transform_l93)
         tr_l93_to_3857 = Transformer.from_crs("EPSG:2154", "EPSG:3857", always_xy=True)
         for feat in courbes_l93:
@@ -389,14 +594,14 @@ def generer_image_carte(
     # Contour du site en 3857
     site_geoms_3857 = list(gdf_3857.geometry)
 
-    # ── 2. Figure avec deux sous-graphes : carte (haut) + tableau (bas) ──────
+    # ── 2. Figure : carte (haut) + tableau (bas, mode constructibilité seul) ─
     # La largeur de la carte est fixe (12 po) ; la hauteur est calculée depuis
-    # le ratio géographique du raster en 3857 pour éviter toute déformation.
+    # le ratio géographique de l'emprise affichée pour éviter toute déformation.
     MAP_W_IN = 12.0
-    TABLE_H_IN = 2.5
+    TABLE_H_IN = 2.5 if avec_tableau else 0.0
     TITLE_H_IN = 0.35
 
-    geo_ratio = (rx1 - rx0) / max(ry1 - ry0, 1)  # largeur / hauteur en mètres
+    geo_ratio = (vx1 - vx0) / max(vy1 - vy0, 1)  # largeur / hauteur en mètres
     map_h_in = MAP_W_IN / geo_ratio
     fig_h_in = map_h_in + TABLE_H_IN + TITLE_H_IN
 
@@ -409,26 +614,35 @@ def generer_image_carte(
         fig.suptitle(titre_fig, fontsize=11, fontweight="bold", y=0.995, va="top")
 
     # Marges exprimées en fraction de la hauteur totale
-    title_frac  = TITLE_H_IN / fig_h_in
-    table_frac  = TABLE_H_IN / fig_h_in
-    top_margin  = 1.0 - title_frac
+    top_margin = 1.0 - TITLE_H_IN / fig_h_in
     bottom_margin = 0.01
 
-    gs = fig.add_gridspec(
-        2, 1,
-        height_ratios=[map_h_in, TABLE_H_IN],
-        hspace=0.04,
-        left=0.01, right=0.99,
-        top=top_margin, bottom=bottom_margin,
-    )
-    ax_carte = fig.add_subplot(gs[0])
-    ax_table = fig.add_subplot(gs[1])
+    if avec_tableau:
+        gs = fig.add_gridspec(
+            2, 1,
+            height_ratios=[map_h_in, TABLE_H_IN],
+            hspace=0.04,
+            left=0.01, right=0.99,
+            top=top_margin, bottom=bottom_margin,
+        )
+        ax_carte = fig.add_subplot(gs[0])
+        ax_table = fig.add_subplot(gs[1])
+    else:
+        gs = fig.add_gridspec(
+            1, 1,
+            left=0.01, right=0.99,
+            top=top_margin, bottom=bottom_margin,
+        )
+        ax_carte = fig.add_subplot(gs[0])
+        ax_table = None
 
     # ── 3. Fond satellite ESRI (contextily) ───────────────────────────────────
     # Le fond est ajouté AVANT le raster pour que les pentes soient au-dessus.
-    # On fixe les limites de l'axe sur les bounds du raster (qui inclut le buffer).
-    ax_carte.set_xlim(rx0, rx1)
-    ax_carte.set_ylim(ry0, ry1)
+    # Les limites sont posées sur l'emprise élargie AVANT add_basemap : contextily
+    # lit les limites courantes pour choisir les tuiles à télécharger. Elles sont
+    # réappliquées ensuite car add_basemap peut les ajuster au bord des tuiles.
+    ax_carte.set_xlim(vx0, vx1)
+    ax_carte.set_ylim(vy0, vy1)
 
     if _HAS_CTX:
         try:
@@ -461,14 +675,19 @@ def generer_image_carte(
         )
 
     # ── 4. Overlay pentes ─────────────────────────────────────────────────────
-    ax_carte.imshow(
-        rgba_3857,
-        extent=[rx0, rx1, ry0, ry1],
-        origin="upper",
-        aspect="auto",
-        zorder=2,
-        interpolation="nearest",
-    )
+    if couches["pentes"]:
+        ax_carte.imshow(
+            rgba_3857,
+            extent=[rx0, rx1, ry0, ry1],
+            origin="upper",
+            aspect="auto",
+            zorder=2,
+            interpolation="nearest",
+        )
+
+    # Réapplication de l'emprise élargie : add_basemap et imshow ont pu la modifier
+    ax_carte.set_xlim(vx0, vx1)
+    ax_carte.set_ylim(vy0, vy1)
 
     # ── 5. Courbes de niveau ──────────────────────────────────────────────────
     for feat in courbes_features:
@@ -490,7 +709,7 @@ def generer_image_carte(
         )
 
     # ── 6. Contour du site — jaune pointillé ─────────────────────────────────
-    for geom in site_geoms_3857:
+    for geom in site_geoms_3857 if couches["contour"] else []:
         if geom is None:
             continue
         if geom.geom_type == "Polygon":
@@ -507,27 +726,93 @@ def generer_image_carte(
                 zorder=5,
             )
 
+    # ── 6b. Zones planes exploitables — mode topographie uniquement ──────────
+    zones_affichees = []
+    if mode == MODE_TOPOGRAPHIE and zones_planes and couches["zones"]:
+        gdf_zones = gpd.GeoDataFrame(
+            geometry=[z["geom"] for z in zones_planes], crs="EPSG:2154"
+        ).to_crs("EPSG:3857")
+        for geom in gdf_zones.geometry:
+            if geom is None or geom.is_empty:
+                continue
+            polys = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+            for poly in polys:
+                x_ext, y_ext = poly.exterior.xy
+                ax_carte.fill(
+                    x_ext, y_ext,
+                    facecolor=COULEUR_ZONE_FILL, alpha=0.35,
+                    edgecolor=COULEUR_ZONE_TRAIT, linewidth=1.6,
+                    zorder=6,
+                )
+        zones_affichees = zones_planes
+
     # ── 7. Légende ────────────────────────────────────────────────────────────
+    if mode == MODE_CONSTRUCTIBILITE:
+        labels_legende = ["Favorable", "Acceptable", "Contraignant", "Exclusion possible"]
+        couleurs_legende = ["#%02x%02x%02x" % _PALETTE[i] for i in range(4)]
+        titre_legende = "Pente — seuils projet"
+    else:
+        labels_legende = _LABELS_TOPO
+        couleurs_legende = _PALETTE_TOPO
+        titre_legende = "Pente du terrain"
+
+    # Ne listent que les couches effectivement dessinées
     legend_elements = [
-        mpatches.Patch(facecolor="#%02x%02x%02x" % _PALETTE[0], label="Favorable"),
-        mpatches.Patch(facecolor="#%02x%02x%02x" % _PALETTE[1], label="Acceptable"),
-        mpatches.Patch(facecolor="#%02x%02x%02x" % _PALETTE[2], label="Contraignant"),
-        mpatches.Patch(facecolor="#%02x%02x%02x" % _PALETTE[3], label="Exclusion possible"),
-        Line2D([0], [0], color="#FFE600", linewidth=2, linestyle="--", label="Contour du site"),
-    ]
-    legend = ax_carte.legend(
-        handles=legend_elements,
-        loc="lower right",
-        fontsize=8,
-        framealpha=0.85,
-        edgecolor="#cccccc",
-        title="Pente — seuils projet",
-        title_fontsize=8,
+        mpatches.Patch(facecolor=c, label=lbl)
+        for c, lbl in zip(couleurs_legende, labels_legende)
+    ] if couches["pentes"] else []
+
+    if couches["contour"]:
+        legend_elements.append(
+            Line2D([0], [0], color="#FFE600", linewidth=2, linestyle="--",
+                   label="Contour du site")
+        )
+    if zones_affichees:
+        seuil_z, largeur_z = zones_params or (3.0, 20.0)
+        legend_elements.append(
+            mpatches.Patch(
+                facecolor=COULEUR_ZONE_FILL, alpha=0.35,
+                edgecolor=COULEUR_ZONE_TRAIT, linewidth=1.6,
+                label=libelle_zones_planes(seuil_z, largeur_z),
+            )
+        )
+    # Aucune couche cochée : pas de boîte de légende vide
+    if legend_elements:
+        legend = ax_carte.legend(
+            handles=legend_elements,
+            loc="lower right",
+            fontsize=8,
+            framealpha=0.85,
+            edgecolor="#cccccc",
+            title=titre_legende if couches["pentes"] else None,
+            title_fontsize=8,
+        )
+        legend.get_frame().set_linewidth(0.8)
+        # Au-dessus des couches (zones planes en zorder 6) — sinon recouverte
+        legend.set_zorder(11)
+
+    # ── 7b. Bandeau de titre en surimpression — lève l'ambiguïté entre modes ──
+    if mode == MODE_CONSTRUCTIBILITE:
+        titre_bandeau = f"Constructibilité — {technologie} · {puissance}"
+    else:
+        titre_bandeau = "Pente du terrain — toutes orientations"
+
+    ax_carte.text(
+        0.5, 0.985,
+        titre_bandeau,
+        transform=ax_carte.transAxes,
+        ha="center", va="top",
+        fontsize=10, fontweight="bold", color="#111111",
+        zorder=9,
+        bbox=dict(
+            boxstyle="round,pad=0.4",
+            facecolor="white", alpha=0.82,
+            edgecolor="#bbbbbb", linewidth=0.8,
+        ),
     )
-    legend.get_frame().set_linewidth(0.8)
 
     # ── 8. Barre d'échelle ────────────────────────────────────────────────────
-    _ajouter_echelle(ax_carte, (rx0, ry0, rx1, ry1))
+    _ajouter_echelle(ax_carte, (vx0, vy0, vx1, vy1))
 
     # ── 9. Logo UNITe ─────────────────────────────────────────────────────────
     # fig.figimage() positionne après le rendu donc on passe fig
@@ -536,7 +821,15 @@ def generer_image_carte(
     # ── 10. Axes carte off ────────────────────────────────────────────────────
     ax_carte.set_axis_off()
 
-    # ── 11. Tableau des seuils ────────────────────────────────────────────────
+    # ── 11. Tableau des seuils — mode constructibilité uniquement ────────────
+    # En mode topographie les seuils sont universels : la légende suffit.
+    if not avec_tableau:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=dpi, facecolor="white")
+        buf.seek(0)
+        plt.close(fig)
+        return buf.getvalue()
+
     ax_table.set_axis_off()
     col_labels, rows = _construire_donnees_tableau(technologie, puissance)
 
@@ -673,44 +966,72 @@ if __name__ == "__main__":
     puissance = "≥5MWc"  # ≥5MWc
 
     print("Parametres : %s / %s" % (technologie, puissance.encode("ascii", "replace").decode()))
-    print("Generation carte PNG (fond satellite ESRI - connexion requise)...")
 
-    t0 = time.time()
+    # ── Detection des zones planes : plusieurs jeux de parametres ────────────
+    print("\nZones planes exploitables :")
+    for seuil_zp, largeur_zp in ((3.0, 20.0), (5.0, 20.0), (5.0, 30.0)):
+        t0 = time.time()
+        zones_test = detecter_zones_planes(
+            pentes, transform, seuil_pente=seuil_zp, largeur_min=largeur_zp
+        )
+        dt = time.time() - t0
+        detail = (
+            ", ".join("%.0f m2" % z["surface"] for z in zones_test)
+            if zones_test else "aucune"
+        )
+        print(
+            "  pente < %.1f %% / largeur >= %2.0f m -> %d zone(s) en %.2f s : %s"
+            % (seuil_zp, largeur_zp, len(zones_test), dt, detail)
+        )
 
-    png_bytes = generer_image_carte(
-        pentes=pentes,
-        orientations=orientations,
-        transform_l93=transform,
-        gdf_site=gdf_site,
-        mnt_brut=mnt_brut,
-        technologie=technologie,
-        puissance=puissance,
-        logo_path=logo_path,
-        dpi=200,
-        avec_courbes=True,
-        nom_fichier="Ancy-le-Libre-contours.zip",
+    # Parametres retenus pour l'export de test
+    SEUIL_ZP, LARGEUR_ZP = 3.0, 20.0
+    zones = detecter_zones_planes(
+        pentes, transform, seuil_pente=SEUIL_ZP, largeur_min=LARGEUR_ZP
     )
 
-    t1 = time.time()
-    duree = t1 - t0
-    if duree > 5:
-        print("[!] Rendu en %.1f s - prevoir un st.spinner() cote Streamlit." % duree)
-    else:
-        print("Rendu en %.1f s." % duree)
+    print("\nGeneration des cartes (fond satellite ESRI - connexion requise)...")
 
-    png_path = "test_export.png"
-    with open(png_path, "wb") as f:
-        f.write(png_bytes)
-    print("PNG ecrit : %s (%.0f Ko)" % (png_path, len(png_bytes) / 1024))
+    # Ordre d'affichage : topographie d'abord, constructibilite ensuite.
+    # Les deux modes partagent MNT, transform et contour : seule la
+    # classification et la palette changent.
+    for mode, base in (
+        (MODE_TOPOGRAPHIE, "test_topographie"),
+        (MODE_CONSTRUCTIBILITE, "test_constructibilite"),
+    ):
+        t0 = time.time()
+        png_bytes = generer_image_carte(
+            pentes=pentes,
+            orientations=orientations,
+            transform_l93=transform,
+            gdf_site=gdf_site,
+            mnt_brut=mnt_brut,
+            technologie=technologie,
+            puissance=puissance,
+            logo_path=logo_path,
+            dpi=200,
+            avec_courbes=True,
+            nom_fichier="Ancy-le-Libre-contours.zip",
+            mode=mode,
+            zones_planes=zones,
+            zones_params=(SEUIL_ZP, LARGEUR_ZP),
+        )
+        duree = time.time() - t0
 
-    print("Conversion PDF...")
-    pdf_bytes = png_vers_pdf(png_bytes)
-    pdf_path = "test_export.pdf"
-    with open(pdf_path, "wb") as f:
-        f.write(pdf_bytes)
-    print("PDF ecrit : %s (%.0f Ko)" % (pdf_path, len(pdf_bytes) / 1024))
+        with open(base + ".png", "wb") as f:
+            f.write(png_bytes)
+        pdf_bytes = png_vers_pdf(png_bytes)
+        with open(base + ".pdf", "wb") as f:
+            f.write(pdf_bytes)
 
-    # Test sans courbes de niveau
+        print(
+            "  %-18s -> %s.png (%.0f Ko) + %s.pdf (%.0f Ko) en %.1f s"
+            % (mode, base, len(png_bytes) / 1024, base, len(pdf_bytes) / 1024, duree)
+        )
+        if duree > 5:
+            print("    [!] > 5 s - prevoir un st.spinner() cote Streamlit.")
+
+    # Cas limite : courbes de niveau desactivees
     print("Test sans courbes de niveau...")
     png_no_curves = generer_image_carte(
         pentes=pentes,
@@ -723,9 +1044,13 @@ if __name__ == "__main__":
         logo_path=logo_path,
         dpi=200,
         avec_courbes=False,
+        nom_fichier="Ancy-le-Libre-contours.zip",
     )
-    with open("test_export_sans_courbes.png", "wb") as f:
+    with open("test_sans_courbes.png", "wb") as f:
         f.write(png_no_curves)
-    print("PNG sans courbes ecrit : test_export_sans_courbes.png")
+    print("  test_sans_courbes.png ecrit")
 
-    print("\nTermine - ouvrir test_export.png et test_export.pdf pour inspection visuelle.")
+    print(
+        "\nTermine - ouvrir test_constructibilite.png/.pdf et "
+        "test_topographie.png/.pdf pour inspection visuelle."
+    )

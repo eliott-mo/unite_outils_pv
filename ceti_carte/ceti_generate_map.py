@@ -965,9 +965,14 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         _target_w = int(_target_h * _logo.width / _logo.height)
         _logo = _logo.resize((_target_w, _target_h), _PILImg.LANCZOS)
         _logo_arr = np.array(_logo)
-        _axes_top_px = int((MARGIN_BOT + ax_h_in) * dpi)
-        _yo = _axes_top_px + (int(MARGIN_TOP * dpi) - _target_h) // 2
+        # Positionnement : coin haut-droit de la figure, dans la marge MARGIN_TOP
+        # figimage avec origin="upper" : yo est compté depuis le HAUT
+        # → yo=0 = tout en haut, on centre verticalement dans MARGIN_TOP
+        _margin_top_px = int(MARGIN_TOP * dpi)
+        _fig_h_px = int(fig_h_in * dpi)
         _fig_w_px = int(fig_w_in * dpi)
+        # yo depuis le haut : centré dans la marge haute
+        _yo = (_margin_top_px - _target_h) // 2
         _xo = _fig_w_px - _target_w - int(0.10 * dpi)
         fig.figimage(_logo_arr, xo=_xo, yo=_yo, origin="upper")
 

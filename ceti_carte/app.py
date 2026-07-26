@@ -1,6 +1,6 @@
 """
 app.py — Interface Streamlit — Générateur de carte CETI
-UNITe PV — AO CRE Sol Période 9
+UNITe PV — AO CRE PPE2 Neutre Période 5
 
 Lancement local : streamlit run app.py
 """
@@ -92,7 +92,12 @@ except FileNotFoundError:
 _col_titre, _col_logo = st.columns([8, 1], vertical_alignment="center")
 with _col_titre:
     st.title("🗺️ CETI - Générateur plan de situation")
-    st.caption("AO CRE PV Sol · Compatible CdC Période 9 · UNITe")
+    st.caption("AO CRE PPE2 Neutre · Compatible CdC Période 5 (juillet 2026) · UNITe")
+    st.caption(
+        "Le plan de situation est exigé en pièce n°2 du dossier de candidature, "
+        "y compris pour les projets ne nécessitant pas de CETI (cas 4 et I du cas 2 bis) : "
+        "cet outil s'applique donc à tous les projets PV au sol."
+    )
 with _col_logo:
     if _logo_b64:
         st.markdown(
@@ -135,7 +140,8 @@ with col_params:
         "Présence de zones humides dans la zone d'implantation ?",
         options=["Non", "Oui"],
         horizontal=True,
-        help="Si oui, la carte devra afficher les ZH et les éléments techniques du projet (requis par le CDC CRE)."
+        help="Si oui, la carte devra afficher les ZH ainsi que les panneaux, pistes, locaux "
+             "techniques, clôture et autres aménagements liés à l'installation (requis par le CdC CRE)."
     )
 
     zh_file = None
@@ -173,23 +179,31 @@ with col_params:
                 help="Fichier KML contenant les rangées de panneaux (LineStrings courtes et/ou polygones)."
             )
             pistes_files = st.file_uploader(
-                "KML pistes et postes — optionnel (1 ou 2 fichiers)",
+                "KML pistes, postes, clôture et autres aménagements — optionnel",
                 type=["kml"],
                 accept_multiple_files=True,
-                help="Fichier(s) KML contenant les pistes d'accès et postes de transformation. Facultatif."
+                help="Fichier(s) KML contenant les pistes d'accès internes et externes, les postes "
+                     "de transformation et locaux techniques, la clôture et tout autre aménagement "
+                     "ou équipement lié à l'installation. Accepte plusieurs fichiers KML. Facultatif."
             )
     else:
-        st.info("ℹ️ Le CdC impose de faire figurer les panneaux, pistes et locaux techniques en présence de zones humides.")
+        st.info(
+            "ℹ️ Le CdC impose de faire apparaître les zones humides ainsi que les "
+            "emplacements des panneaux, des pistes internes et externes, des locaux "
+            "techniques, de la clôture et de tout autre aménagement lié à l'installation."
+        )
         panneaux_file = st.file_uploader(
             "KML rangées de panneaux — lignes et polygones des tables solaires (.kml)",
             type=["kml"],
             help="Fichier KML contenant les rangées de panneaux (LineStrings courtes et/ou polygones). Obligatoire si zones humides."
         )
         pistes_files = st.file_uploader(
-            "KML pistes et postes — optionnel (1 ou 2 fichiers)",
+            "KML pistes, postes, clôture et autres aménagements — optionnel",
             type=["kml"],
             accept_multiple_files=True,
-            help="Fichier(s) KML contenant les pistes d'accès (LineStrings) et postes de transformation (points). Accepte 1 ou 2 fichiers KML."
+            help="Fichier(s) KML contenant les pistes d'accès internes et externes (LineStrings), "
+                 "les postes de transformation et locaux techniques (points), la clôture et tout "
+                 "autre aménagement ou équipement lié à l'installation. Accepte plusieurs fichiers KML."
         )
 
     # ── 5. Paramètres ────────────────────────────────────────────────────────

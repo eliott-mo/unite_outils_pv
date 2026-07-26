@@ -138,39 +138,62 @@ with col_params:
         help="Si oui, la carte devra afficher les ZH et les éléments techniques du projet (requis par le CDC CRE)."
     )
 
-    zh_file        = None
-    panneaux_file  = None
-    pistes_files   = []
-
+    zh_file = None
     if zh_presence == "Oui":
-        st.info("ℹ️ Le CDC impose d'afficher les zones humides, les panneaux, les pistes et les locaux techniques sur la carte.")
         zh_file = st.file_uploader(
             "Couche zones humides (.zip shapefile, .kml ou .geojson)",
             type=["zip", "kml", "geojson", "json"],
             help="Fichier fourni par le BE environnemental. Formats acceptés : shapefile zippé, KML, GeoJSON."
         )
+
+    # ── 4. Zone d'implantation des capteurs ──────────────────────────────────
+    st.subheader("4 · Zone d'implantation des capteurs")
+
+    panneaux_file = None
+    pistes_files  = []
+    recul         = 10
+    mode_capteurs = None
+
+    if zh_presence == "Non":
+        mode_capteurs = st.radio(
+            "Mode de délimitation",
+            options=["Recul automatique depuis le terrain", "Depuis le plan d'implantation (KML)"],
+            help="Le recul applique un buffer négatif au shapefile terrain. Le mode KML trace la zone autour des clusters de panneaux fournis."
+        )
+        if mode_capteurs == "Recul automatique depuis le terrain":
+            recul = st.slider(
+                "Recul zone capteurs PV (m)",
+                min_value=0, max_value=100, value=10, step=1,
+                help="Buffer négatif appliqué au terrain d'implantation pour délimiter la zone des capteurs PV au sens du CdC de la CRE."
+            )
+        else:
+            panneaux_file = st.file_uploader(
+                "KML rangées de panneaux — lignes et polygones des tables solaires (.kml)",
+                type=["kml"],
+                help="Fichier KML contenant les rangées de panneaux (LineStrings courtes et/ou polygones)."
+            )
+            pistes_files = st.file_uploader(
+                "KML pistes et postes — optionnel (1 ou 2 fichiers)",
+                type=["kml"],
+                accept_multiple_files=True,
+                help="Fichier(s) KML contenant les pistes d'accès et postes de transformation. Facultatif."
+            )
+    else:
+        st.info("ℹ️ Le CdC impose de faire figurer les panneaux, pistes et locaux techniques en présence de zones humides.")
         panneaux_file = st.file_uploader(
             "KML rangées de panneaux — lignes et polygones des tables solaires (.kml)",
             type=["kml"],
-            help="Fichier KML contenant uniquement les rangées de panneaux (LineStrings courtes et/ou polygones). Obligatoire si zones humides."
+            help="Fichier KML contenant les rangées de panneaux (LineStrings courtes et/ou polygones). Obligatoire si zones humides."
         )
         pistes_files = st.file_uploader(
             "KML pistes et postes — optionnel (1 ou 2 fichiers)",
             type=["kml"],
             accept_multiple_files=True,
-            help="Fichier(s) KML contenant les pistes d'accès (LineStrings) et postes de transformation (points). Accepte 1 ou 2 fichiers KML. Facultatif : améliore la délimitation des clusters de panneaux."
+            help="Fichier(s) KML contenant les pistes d'accès (LineStrings) et postes de transformation (points). Accepte 1 ou 2 fichiers KML."
         )
 
-    st.subheader("4 · Paramètres")
-    if zh_presence == "Non":
-        recul = st.slider(
-            "Recul zone capteurs PV (m)",
-            min_value=0, max_value=100, value=10, step=1,
-            help="Buffer négatif appliqué au terrain d'implantation pour délimiter la zone des capteurs PV au sens du CdC de la CRE."
-        )
-    else:
-        recul = 10  # non utilisé quand éléments techniques fournis
-        st.caption("ℹ️ Le recul zone capteurs est calculé automatiquement depuis les éléments techniques (5 m).")
+    # ── 5. Paramètres ────────────────────────────────────────────────────────
+    st.subheader("5 · Paramètres")
     fond_aerien = st.toggle(
         "Fond aérien IGN Géoportail",
         value=True,
@@ -187,12 +210,14 @@ with col_params:
 
     # ── Validation ────────────────────────────────────────────────────────────
     manquants = []
-    if zip_file is None:           manquants.append("shapefile terrain")
-    if not nom_projet.strip():     manquants.append("nom du projet")
-    if not urbanisme.strip():      manquants.append("document d'urbanisme applicable")
+    if zip_file is None:       manquants.append("shapefile terrain")
+    if not nom_projet.strip(): manquants.append("nom du projet")
+    if not urbanisme.strip():  manquants.append("document d'urbanisme applicable")
     if zh_presence == "Oui":
-        if zh_file is None:        manquants.append("couche zones humides")
-        if panneaux_file is None:  manquants.append("KML rangées de panneaux")
+        if zh_file is None:       manquants.append("couche zones humides")
+        if panneaux_file is None: manquants.append("KML rangées de panneaux")
+    elif mode_capteurs == "Depuis le plan d'implantation (KML)":
+        if panneaux_file is None: manquants.append("KML rangées de panneaux")
 
     pret = len(manquants) == 0
     if not pret:

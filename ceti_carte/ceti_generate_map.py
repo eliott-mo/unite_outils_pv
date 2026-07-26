@@ -1,6 +1,6 @@
 """
 ceti_generate_map.py — Générateur de carte de situation CETI
-UNITe PV — AO CRE Sol Période 9
+UNITe PV — AO CRE PPE2 Neutre Période 5
 
 Expose generer_carte() appelée par app.py.
 Peut aussi être lancé directement depuis un terminal.

@@ -423,32 +423,30 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         mask_poly_p  = gdf_panneaux.geometry.geom_type.isin(["Polygon","MultiPolygon"])
         mask_lines_p = gdf_panneaux.geometry.geom_type.isin(["LineString","MultiLineString"])
 
-        # Approche rapide : buffer directement sur l'union des lignes
-        # Évite le polygonize (21 000 petits polys → unary_union lent)
-        # Buffer +5m fusionne les rangées proches → union → buffer -5m sépare les clusters
-        BUF_CLOSE = 5
-
-        _geoms_panneaux = []
+        # 6.5 m : fusionne les espaces entre tables jusqu'a 13 m
+        BUF_CLOSE = 6.5
+        base_parts = []
         if mask_lines_p.any():
-            _geoms_panneaux.append(unary_union(gdf_panneaux[mask_lines_p].geometry))
+            _u = unary_union(gdf_panneaux[mask_lines_p].geometry)
+            _pg = [p for p in _polygonize(_u) if p.area >= 0.5]
+            if _pg:
+                base_parts.append(unary_union(_pg))
+                print("Polygonize panneaux : {} polygones, {:.2f} ha".format(
+                    len(_pg), sum(p.area for p in _pg) / 10000))
+            else:
+                base_parts.append(_u.buffer(BUF_CLOSE))
+                print("Polygonize : 0 anneau -> fallback buffer sur lignes")
         if mask_poly_p.any():
-            _geoms_panneaux.append(unary_union(gdf_panneaux[mask_poly_p].geometry))
-
-        if _geoms_panneaux:
+            base_parts.append(unary_union(gdf_panneaux[mask_poly_p].geometry))
+        if base_parts:
             _ts("Closing debut")
-            _base = unary_union(_geoms_panneaux)
+            _base = unary_union(base_parts)
             zones_merged = _base.buffer(BUF_CLOSE).buffer(-BUF_CLOSE)
             _ts("Closing termine")
             n_zones = len(list(zones_merged.geoms)) if hasattr(zones_merged, "geoms") else (0 if zones_merged.is_empty else 1)
             print("Closing +{}/-{}m : {} zones, {:.2f} ha".format(BUF_CLOSE, BUF_CLOSE, n_zones, zones_merged.area/10000))
 
-        if _geoms_panneaux:
-            n_zones = (len(list(zones_merged.geoms))
-                       if hasattr(zones_merged, "geoms")
-                       else (0 if zones_merged.is_empty else 1))
-            print("Closing +{}/-{}m : {} zones, {:.2f} ha".format(
-                BUF_CLOSE, BUF_CLOSE, n_zones, zones_merged.area / 10000))
-
+        if base_parts:
             # 4. Soustraction corridors pistes (3m) si KML pistes fourni
             if gdf_pistes is not None and len(gdf_pistes) > 0:
                 mask_lines_r = gdf_pistes.geometry.geom_type.isin(

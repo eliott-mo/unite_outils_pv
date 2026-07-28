@@ -5,73 +5,10 @@ UNITe PV — AO CRE PPE2 Neutre Période 5
 Lancement local : streamlit run app.py
 """
 
-import os, re, zipfile, tempfile, base64
+import io, os, re, zipfile, tempfile, base64
 import streamlit as st
+from PIL import Image
 from ceti_generate_map import generer_carte
-
-
-def _generer_carte_cached(
-    zip_bytes, nom_projet, recul_capteurs, urbanisme,
-    echelle, fond_aerien, dpi, fmt,
-    zh_bytes=None, zh_ext=".zip", panneaux_bytes=None, pistes_bytes_list=None,
-):
-    """
-    Wrapper autour de generer_carte().
-    Les arguments sont des bytes (contenu des fichiers), pas des chemins :
-    Streamlit hache le contenu pour la clé de cache → même fichier = cache hit.
-    TTL implicite via le cycle de vie de la session Streamlit.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Terrain shapefile
-        zip_path = os.path.join(tmpdir, "terrain.zip")
-        with open(zip_path, "wb") as f:
-            f.write(zip_bytes)
-        with zipfile.ZipFile(zip_path) as zf:
-            zf.extractall(tmpdir)
-        shp = None
-        for root, _, files in os.walk(tmpdir):
-            for fn in files:
-                if fn.endswith(".shp"):
-                    shp = os.path.join(root, fn)
-                    break
-            if shp:
-                break
-
-        # Couches optionnelles
-        zh_path = None
-        if zh_bytes and zh_ext:
-            zh_path = os.path.join(tmpdir, "zh{}".format(zh_ext))
-            with open(zh_path, "wb") as f:
-                f.write(zh_bytes)
-
-        panneaux_path = None
-        if panneaux_bytes:
-            panneaux_path = os.path.join(tmpdir, "panneaux.kml")
-            with open(panneaux_path, "wb") as f:
-                f.write(panneaux_bytes)
-
-        pistes_paths = None
-        if pistes_bytes_list:
-            pistes_paths = []
-            for i, pb in enumerate(pistes_bytes_list):
-                p = os.path.join(tmpdir, "pistes_{}.kml".format(i))
-                with open(p, "wb") as f:
-                    f.write(pb)
-                pistes_paths.append(p)
-
-        return generer_carte(
-            shp_path       = shp,
-            nom_projet     = nom_projet,
-            recul_capteurs = recul_capteurs,
-            urbanisme      = urbanisme,
-            echelle        = echelle,
-            fond_aerien    = fond_aerien,
-            dpi            = dpi,
-            zh_path        = zh_path,
-            kml_panneaux   = panneaux_path,
-            kml_pistes     = pistes_paths,
-            format         = fmt,
-        )
 
 st.set_page_config(
     page_title="CETI - Générateur plan de situation",
@@ -101,8 +38,8 @@ with _col_titre:
 with _col_logo:
     if _logo_b64:
         st.markdown(
-            f'<div style="text-align:right;">' 
-            f'<img src="data:image/png;base64,{_logo_b64}" ' 
+            f'<div style="text-align:right;">'
+            f'<img src="data:image/png;base64,{_logo_b64}" '
             f'style="height:85px;max-width:100%;"></div>',
             unsafe_allow_html=True,
         )
@@ -263,56 +200,89 @@ with col_result:
 
     else:
         try:
-            # ── Lecture des bytes (clés de cache, indépendant des chemins tmp) ─
-            zip_bytes      = zip_file.read()
-            zh_bytes       = zh_file.read()       if zh_file       else None
-            panneaux_bytes = panneaux_file.read() if panneaux_file  else None
-            pistes_blist   = [pf.read() for pf in (pistes_files or [])] or None
-
             fmt_lower = format_export.lower()
+            # PDF : on rastérise à 300 dpi (qualité DREAL), PNG : 150 dpi
+            dpi_gen = 300 if fmt_lower == "pdf" else 150
 
-            # ── Génération (cachée) ────────────────────────────────────────────
-            with st.spinner("Génération de la carte en cours… (chargement fond aérien si activé)"):
-                carte_bytes = _generer_carte_cached(
-                    zip_bytes      = zip_bytes,
-                    nom_projet     = nom_projet.strip(),
-                    recul_capteurs = recul,
-                    urbanisme      = urbanisme.strip(),
-                    echelle        = 5000,
-                    fond_aerien    = fond_aerien,
-                    dpi            = 150,
-                    fmt            = fmt_lower,
-                    zh_bytes       = zh_bytes,
-                    zh_ext         = os.path.splitext(zh_file.name)[1] if zh_file else ".zip",
-                    panneaux_bytes = panneaux_bytes,
-                    pistes_bytes_list = pistes_blist,
-                )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Terrain shapefile
+                zip_path = os.path.join(tmpdir, "terrain.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(zip_file.read())
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(tmpdir)
+                shp = None
+                for root, _, files in os.walk(tmpdir):
+                    for fn in files:
+                        if fn.endswith(".shp"):
+                            shp = os.path.join(root, fn)
+                            break
+                    if shp:
+                        break
 
-            st.success("✅ Carte générée avec succès !")
+                # Couches optionnelles
+                zh_path = None
+                if zh_file:
+                    zh_ext  = os.path.splitext(zh_file.name)[1]
+                    zh_path = os.path.join(tmpdir, "zh{}".format(zh_ext))
+                    with open(zh_path, "wb") as f:
+                        f.write(zh_file.read())
 
-            # Aperçu toujours en PNG (le cache évite la 2e génération si déjà PNG)
-            if fmt_lower == "pdf":
-                with st.spinner("Aperçu PNG…"):
-                    apercu_bytes = _generer_carte_cached(
-                        zip_bytes      = zip_bytes,
+                panneaux_path = None
+                if panneaux_file:
+                    panneaux_path = os.path.join(tmpdir, "panneaux.kml")
+                    with open(panneaux_path, "wb") as f:
+                        f.write(panneaux_file.read())
+
+                pistes_paths = None
+                if pistes_files:
+                    pistes_paths = []
+                    for i, pf in enumerate(pistes_files):
+                        p = os.path.join(tmpdir, "pistes_{}.kml".format(i))
+                        with open(p, "wb") as f:
+                            f.write(pf.read())
+                        pistes_paths.append(p)
+
+                # ── Génération unique en PNG (le PDF en est dérivé) ────────────
+                with st.spinner("Génération de la carte en cours… (chargement fond aérien si activé)"):
+                    png_bytes = generer_carte(
+                        shp_path       = shp,
                         nom_projet     = nom_projet.strip(),
                         recul_capteurs = recul,
                         urbanisme      = urbanisme.strip(),
                         echelle        = 5000,
                         fond_aerien    = fond_aerien,
-                        dpi            = 100,
-                        fmt            = "png",
-                        zh_bytes       = zh_bytes,
-                        zh_ext         = os.path.splitext(zh_file.name)[1] if zh_file else '.zip',
-                        panneaux_bytes = panneaux_bytes,
-                        pistes_bytes_list = pistes_blist,
+                        dpi            = dpi_gen,
+                        zh_path        = zh_path,
+                        kml_panneaux   = panneaux_path,
+                        kml_pistes     = pistes_paths,
+                        format         = "png",
                     )
-                st.image(apercu_bytes, use_container_width=True)
-            else:
-                st.image(carte_bytes, use_container_width=True)
 
-            _slug     = re.sub(r"[^\w]+", "_", nom_projet.strip()).strip("_")
-            mime_type = "application/pdf" if fmt_lower == "pdf" else "image/png"
+            st.success("✅ Carte générée avec succès !")
+
+            # Aperçu : réduit si l'image est très large (évite un transfert inutile)
+            _img = Image.open(io.BytesIO(png_bytes))
+            if _img.width > 2200:
+                _h = int(_img.height * 2200 / _img.width)
+                _buf_prev = io.BytesIO()
+                _img.resize((2200, _h), Image.LANCZOS).save(_buf_prev, format="PNG")
+                st.image(_buf_prev.getvalue(), use_container_width=True)
+            else:
+                st.image(png_bytes, use_container_width=True)
+
+            # ── Export : conversion PDF en mémoire au moment du téléchargement ─
+            _slug = re.sub(r"[^\w]+", "_", nom_projet.strip()).strip("_")
+            if fmt_lower == "pdf":
+                _buf_pdf = io.BytesIO()
+                Image.open(io.BytesIO(png_bytes)).save(
+                    _buf_pdf, format="PDF", resolution=300)
+                carte_bytes = _buf_pdf.getvalue()
+                mime_type   = "application/pdf"
+            else:
+                carte_bytes = png_bytes
+                mime_type   = "image/png"
+
             st.download_button(
                 label            = "⬇️ Télécharger la carte ({})".format(format_export),
                 data             = carte_bytes,

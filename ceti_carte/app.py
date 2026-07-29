@@ -201,8 +201,9 @@ with col_result:
     else:
         try:
             fmt_lower = format_export.lower()
-            # PDF : on rastérise à 300 dpi (qualité DREAL), PNG : 150 dpi
-            dpi_gen = 300 if fmt_lower == "pdf" else 150
+            # PDF : 200 dpi = 0,63 m/pixel au sol à 1/5000, suffisant pour la DREAL
+            # et tenable en mémoire sur les grands sites. PNG écran : 150 dpi.
+            dpi_gen = 200 if fmt_lower == "pdf" else 150
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 # Terrain shapefile
@@ -261,27 +262,47 @@ with col_result:
 
             st.success("✅ Carte générée avec succès !")
 
-            # Aperçu : réduit si l'image est très large (évite un transfert inutile)
+            # Une seule décode PIL, réutilisée pour l'aperçu puis pour le PDF
             _img = Image.open(io.BytesIO(png_bytes))
+
+            # Aperçu : réduit si l'image est très large (évite un transfert inutile)
             if _img.width > 2200:
                 _h = int(_img.height * 2200 / _img.width)
                 _buf_prev = io.BytesIO()
                 _img.resize((2200, _h), Image.LANCZOS).save(_buf_prev, format="PNG")
                 st.image(_buf_prev.getvalue(), use_container_width=True)
+                _buf_prev.close()
             else:
                 st.image(png_bytes, use_container_width=True)
 
             # ── Export : conversion PDF en mémoire au moment du téléchargement ─
             _slug = re.sub(r"[^\w]+", "_", nom_projet.strip()).strip("_")
             if fmt_lower == "pdf":
+                # convert("RGB") est LE point critique : en RGBA, PIL monte a
+                # 2940 Mo contre 690 Mo en RGB. Ne jamais retirer cette conversion.
+                # Garde-fou 24 Mpx : la memoire croit avec le carre de l'emprise.
+                MAX_MPX = 24e6
+                # Largeur physique de la page, en pouces : invariant qui porte
+                # l'echelle 1/5000. Elle ne doit pas bouger si on redimensionne.
+                _phys_w = _img.width / dpi_gen
+                _npx = _img.width * _img.height
+                if _npx > MAX_MPX:
+                    _k = (MAX_MPX / _npx) ** 0.5
+                    _img = _img.resize(
+                        (int(_img.width * _k), int(_img.height * _k)), Image.LANCZOS)
+                # resolution recalculee : conserve la taille physique exacte
+                _res = _img.width / _phys_w
+                _pdf_src = _img.convert("RGB")
                 _buf_pdf = io.BytesIO()
-                Image.open(io.BytesIO(png_bytes)).save(
-                    _buf_pdf, format="PDF", resolution=300)
+                _pdf_src.save(_buf_pdf, format="PDF", resolution=_res)
                 carte_bytes = _buf_pdf.getvalue()
                 mime_type   = "application/pdf"
+                _pdf_src.close()
+                _buf_pdf.close()
             else:
                 carte_bytes = png_bytes
                 mime_type   = "image/png"
+            _img.close()
 
             st.download_button(
                 label            = "⬇️ Télécharger la carte ({})".format(format_export),

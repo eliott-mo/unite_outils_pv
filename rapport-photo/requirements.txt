@@ -1,7 +1,0 @@
-streamlit>=1.36
-pillow>=10.0
-pillow-heif>=0.16
-pytesseract>=0.3.10
-opencv-python-headless>=4.9
-numpy>=1.26
-pandas>=2.0

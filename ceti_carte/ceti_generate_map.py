@@ -984,13 +984,22 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     buf = io.BytesIO()
     _ts("savefig debut ({}, dpi={})".format(fmt, dpi if fmt == "png" else 300))
     if fmt == "pdf":
-        # PNG 300 dpi → conversion PIL→PDF : ~3× plus rapide que savefig vectoriel
+        # convert("RGB") est LE point critique : en RGBA, PIL monte a 2940 Mo
+        # contre 690 Mo en RGB a dpi identique. Ne jamais retirer cette conversion.
+        # dpi 200 = 0,63 m/pixel au sol a 1/5000, pic mesure 347 Mo.
+        # Garde-fou : on plafonne le nombre total de pixels pour les tres grands
+        # sites, sinon la memoire croit avec le carre de l'emprise.
         from PIL import Image as _PIL
+        MAX_MPX  = 24e6
+        _dpi_pdf = int(min(200, (MAX_MPX / (fig_w_in * fig_h_in)) ** 0.5))
         _buf_png = io.BytesIO()
-        plt.savefig(_buf_png, dpi=300, facecolor="white", format="png")
+        plt.savefig(_buf_png, dpi=_dpi_pdf, facecolor="white", format="png")
         plt.close()
         _buf_png.seek(0)
-        _PIL.open(_buf_png).save(buf, format="PDF", resolution=300)
+        _img = _PIL.open(_buf_png).convert("RGB")
+        _img.save(buf, format="PDF", resolution=_dpi_pdf)
+        _img.close()
+        _buf_png.close()
     else:
         plt.savefig(buf, dpi=dpi, facecolor="white", format="png")
         plt.close()

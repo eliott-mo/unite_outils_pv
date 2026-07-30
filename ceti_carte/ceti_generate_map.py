@@ -135,21 +135,22 @@ def to_dms(deg, is_lat):
 
 def calcul_extremaux(terrain, tr, echelle=5000):
     """
-    Selectionne jusqu'a 4 points sur l'enveloppe convexe avec repartition optimale.
+    Selectionne 4 points bien repartis sur le contour reel du terrain.
 
     Algorithme
     ----------
-    1. A = sommet le plus au nord (max Y).
-    2. B = sommet maximisant la distance a A.
-    3. C = sommet maximisant la distance minimale a {A, B} (maximin).
-    4. D = sommet maximisant la distance minimale a {A, B, C} (maximin).
-    Contrainte : si le meilleur candidat est a moins de MIN_DIST (15 % diagonale)
-    du plus proche point deja selectionne, on force le sommet globalement le plus
-    eloigne (meme resultat sur formes convexes regulieres, correction sur formes
-    degenrees a peu de sommets).
+    0. Echantillonnage de N_ECH points candidats sur le contour (et non sur
+       l'enveloppe convexe) : les points restent sur le perimetre meme si la
+       forme est concave, allongee ou composee de plusieurs parcelles, et le
+       resultat ne depend plus du nombre de sommets (un triangle fonctionne).
+    1. A = candidat le plus au nord (max Y).
+    2. B = candidat maximisant la distance a A.
+    3. C = candidat maximisant la distance minimale a {A, B} (maximin).
+    4. D = candidat maximisant la distance minimale a {A, B, C} (maximin).
+
+    Chaque point recoit ensuite l'une des 4 directions cardinales d'annotation,
+    attribuee sans doublon selon sa direction sortante depuis le centroide.
     """
-    hull_pts = np.array(terrain.convex_hull.exterior.coords[:-1])
-    n        = len(hull_pts)
     cx, cy   = terrain.centroid.x, terrain.centroid.y
 
     minx, miny, maxx, maxy = terrain.bounds
@@ -159,43 +160,71 @@ def calcul_extremaux(terrain, tr, echelle=5000):
     # PUSH : depasse la demi-largeur du terrain + marge lisible, cap a 150 pts
     terrain_hw = max(maxx - minx, maxy - miny) / 2
     PUSH = max(min(int(terrain_hw / M_PER_PT) + 25, 150), 40)
-    diag = math.hypot(maxx - minx, maxy - miny)
 
-    # ── Selection cardinale : A=N (max Y), B=E (max X), C=S (min Y), D=W (min X) ─
-    card_cfg = [
-        ("A", int(np.argmax(hull_pts[:, 1])), (-BOX_W // 2,  PUSH),           (0.0,  1.0)),
-        ("B", int(np.argmax(hull_pts[:, 0])), (PUSH, -BOX_H // 2),            (1.0,  0.0)),
-        ("C", int(np.argmin(hull_pts[:, 1])), (-BOX_W // 2, -(BOX_H + PUSH)), (0.0, -1.0)),
-        ("D", int(np.argmin(hull_pts[:, 0])), (-(BOX_W + PUSH), -BOX_H // 2), (-1.0, 0.0)),
+    N_ECH = 400   # points candidats echantillonnes sur le contour
+    # Candidats sur le contour REEL du terrain (et non le hull) : garantit que les
+    # points sont sur le perimetre, y compris sur terrain concave ou multi-parcelles
+    _bnd   = terrain.boundary
+    _cand  = [np.array(_bnd.interpolate(i / N_ECH, normalized=True).coords)[0][:2]
+              for i in range(N_ECH)]
+    # A = point le plus au nord (convention conservee)
+    _sel = [int(np.argmax([c[1] for c in _cand]))]
+    # B, C, D = selection gloutonne du point le plus eloigne des deja retenus (maximin)
+    for _ in range(3):
+        _sel.append(max(
+            (k for k in range(N_ECH) if k not in _sel),
+            key=lambda k: min(math.dist(_cand[k], _cand[s]) for s in _sel)
+        ))
+
+    # Offsets d'annotation : 4 directions cardinales, une par point.
+    _tmpl = [
+        ((-BOX_W // 2,  PUSH),           (0.0,  1.0)),   # N
+        ((PUSH, -BOX_H // 2),            (1.0,  0.0)),   # E
+        ((-BOX_W // 2, -(BOX_H + PUSH)), (0.0, -1.0)),   # S
+        ((-(BOX_W + PUSH), -BOX_H // 2), (-1.0, 0.0)),   # O
     ]
 
-    used_idx = set()
+    # Position et direction sortante (depuis le centroide) des 4 points retenus
+    _pxy, _dirs = [], []
+    for k in _sel:
+        px, py = float(_cand[k][0]), float(_cand[k][1])
+        _vx, _vy = px - cx, py - cy
+        _nrm = max(math.hypot(_vx, _vy), 1e-9)
+        _pxy.append((px, py))
+        _dirs.append((_vx / _nrm, _vy / _nrm))
+
+    # Longueur de la ligne de rappel qui traverserait l'emprise
+    from shapely.geometry import LineString as _LS
+    def _coupe(pt, adx, ady):
+        bx = pt[0] + (adx + BOX_W / 2) * M_PER_PT
+        by = pt[1] + (ady + BOX_H / 2) * M_PER_PT
+        try:
+            return _LS([pt, (bx, by)]).intersection(terrain).length
+        except Exception:
+            return 0.0
+
+    # Attribution optimale sur les 24 permutations : on minimise d'abord la
+    # longueur totale de fleche traversant le terrain (une ligne de rappel ne
+    # doit pas couper l'emprise), puis on maximise l'alignement sortant.
+    # L'heuristique par centroide seule echoue sur les formes allongees en
+    # diagonale : le dernier point recoit par elimination une direction qui
+    # renvoie la fleche a travers la parcelle.
+    import itertools as _it
+    _best, _bkey = None, None
+    for _perm in _it.permutations(range(len(_tmpl))):
+        _c = _a = 0.0
+        for _i, _t in enumerate(_perm):
+            (adx, ady), (dux, duy) = _tmpl[_t]
+            _c += _coupe(_pxy[_i], adx, ady)
+            _a += _dirs[_i][0] * dux + _dirs[_i][1] * duy
+        _key = (round(_c, 1), -_a)
+        if _bkey is None or _key < _bkey:
+            _bkey, _best = _key, _perm
+
     result = []
-    for lbl, idx, (adx, ady), (dux, duy) in card_cfg:
-        if idx in used_idx:
-            remaining = [k for k in range(n) if k not in used_idx]
-            if not remaining:
-                continue
-            if   duy > 0: idx = int(max(remaining, key=lambda k: hull_pts[k][1]))
-            elif dux > 0: idx = int(max(remaining, key=lambda k: hull_pts[k][0]))
-            elif duy < 0: idx = int(min(remaining, key=lambda k: hull_pts[k][1]))
-            else:         idx = int(min(remaining, key=lambda k: hull_pts[k][0]))
-        # Corner-snapping : si un sommet voisin (< 15% diag) est plus eloigne du
-        # centroide, il est plus "en coin" — on le prefere.
-        snap_r = diag * 0.15
-        _px0, _py0 = hull_pts[idx]
-        _d0 = math.hypot(_px0 - cx, _py0 - cy)
-        for _k in range(n):
-            if _k == idx or _k in used_idx:
-                continue
-            _pkx, _pky = hull_pts[_k]
-            if math.hypot(_pkx - _px0, _pky - _py0) <= snap_r:
-                _dk = math.hypot(_pkx - cx, _pky - cy)
-                if _dk > _d0:
-                    idx = _k
-                    _d0 = _dk
-        used_idx.add(idx)
-        px, py   = hull_pts[idx]
+    for _i, lbl in enumerate("ABCD"[:len(_sel)]):
+        px, py = _pxy[_i]
+        (adx, ady), (dux, duy) = _tmpl[_best[_i]]
         lon, lat = tr.transform(px, py)
         result.append({
             "label":  "Pt {}".format(lbl),
@@ -447,18 +476,27 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
             print("Closing +{}/-{}m : {} zones, {:.2f} ha".format(BUF_CLOSE, BUF_CLOSE, n_zones, zones_merged.area/10000))
 
         if base_parts:
-            # 4. Soustraction corridors pistes (3m) si KML pistes fourni
+            # 4. Soustraction corridors pistes si KML pistes fourni
+            BUF_PISTE = 3
             if gdf_pistes is not None and len(gdf_pistes) > 0:
-                mask_lines_r = gdf_pistes.geometry.geom_type.isin(
-                    ["LineString", "MultiLineString"])
-                if mask_lines_r.any():
-                    pistes_buf = unary_union(
-                        gdf_pistes[mask_lines_r].geometry).buffer(3)
-                    zones_merged = zones_merged.difference(pistes_buf)
-                    n_ap = (len(list(zones_merged.geoms))
-                            if hasattr(zones_merged, "geoms")
-                            else (0 if zones_merged.is_empty else 1))
-                    print("Soustraction corridors pistes (3m) -> {} clusters".format(n_ap))
+                # ATTENTION — ordre des operations volontairement inverse de
+                # celui des panneaux. Sur des LIGNES qui s'entrecroisent,
+                # unary_union produit une geometrie massivement auto-intersectee
+                # dont le buffer fait exploser GEOS. Mesure sur Chamouilley
+                # (366 lignes, 76 km, 15 595 sommets) :
+                #   unary_union(pistes).buffer(3)  -> 95,1 s et 1946 Mo
+                #   pistes.buffer(3).union_all()   ->  0,8 s et  185 Mo
+                # resultat geometrique identique.
+                # Ne pas "harmoniser" avec le traitement des panneaux, qui lui
+                # exige unary_union AVANT le buffer parce qu'il porte sur des
+                # polygones simples.
+                _corridors = gdf_pistes.geometry.buffer(BUF_PISTE).union_all()
+                zones_merged = zones_merged.difference(_corridors)
+                n_ap = (len(list(zones_merged.geoms))
+                        if hasattr(zones_merged, "geoms")
+                        else (0 if zones_merged.is_empty else 1))
+                print("Soustraction corridors pistes ({}m, {:.2f} ha) -> {} clusters".format(
+                    BUF_PISTE, _corridors.area / 10000, n_ap))
 
             # 5. Éclater en clusters individuels, buffer +3m pour zone capteurs
             if hasattr(zones_merged, "geoms"):
@@ -963,15 +1001,13 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         _target_w = int(_target_h * _logo.width / _logo.height)
         _logo = _logo.resize((_target_w, _target_h), _PILImg.LANCZOS)
         _logo_arr = np.array(_logo)
-        # Positionnement : coin haut-droit de la figure, dans la marge MARGIN_TOP
-        # figimage avec origin="upper" : yo est compté depuis le HAUT
-        # → yo=0 = tout en haut, on centre verticalement dans MARGIN_TOP
-        _margin_top_px = int(MARGIN_TOP * dpi)
-        _fig_h_px = int(fig_h_in * dpi)
-        _fig_w_px = int(fig_w_in * dpi)
-        # yo depuis le haut : centré dans la marge haute
-        _yo = (_margin_top_px - _target_h) // 2
-        _xo = _fig_w_px - _target_w - int(0.10 * dpi)
+        # yo est TOUJOURS compte depuis le BAS du canvas, meme avec origin="upper" :
+        # origin ne controle que le sens de lecture du tableau de pixels.
+        # On vise le centre vertical de la bande de marge haute (celle du titre) :
+        # on part du haut de l'axe cartographique, puis on centre le logo dedans.
+        _axes_top_px = int((MARGIN_BOT + ax_h_in) * dpi)
+        _yo = _axes_top_px + (int(MARGIN_TOP * dpi) - _target_h) // 2
+        _xo = int(fig_w_in * dpi) - _target_w - int(0.10 * dpi)
         fig.figimage(_logo_arr, xo=_xo, yo=_yo, origin="upper")
 
     ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)

@@ -24,8 +24,19 @@ donc structurellement identique à un fichier fraîchement généré ici : il se
 rouvre, se réédite et se retransmet sans limite, sans distinction entre
 « original » et « déjà édité ».
 
-FORMAT DU BLOC `#donnees-carte` (lu par l'étape 3 — réimport dans Streamlit)
----------------------------------------------------------------------------
+RÉIMPORT — COMPLÉTER UNE CARTE EXISTANTE
+----------------------------------------
+`extraire_donnees()` relit le bloc `#donnees-carte` d'une carte déjà générée et
+`completer_carte()` y ajoute les points de nouvelles photos, puis réémet le HTML
+depuis cet objet enrichi. Les points existants ne sont jamais reconstruits :
+leur image base64 et toutes leurs éditions (commentaire, corbeille, nom, ordre,
+direction figée) sont reprises telles quelles, tout comme la note, la
+calibration et le seuil de précision. Seul le titre peut être changé au
+passage, pour dater une nouvelle version. Un aller-retour sans nouvelle photo
+ni nouveau titre redonne donc le fichier de départ.
+
+FORMAT DU BLOC `#donnees-carte` (lu au réimport)
+------------------------------------------------
 C'est ce bloc qui fait foi, pas le DOM. Objet JSON :
 
     {
@@ -74,12 +85,15 @@ LECTURE DES CARTES VERSION 2
 Une carte version 2 ne portait qu'un champ `cap`, offset et corrections déjà
 appliqués. À l'ouverture, la page la convertit sans rien changer à l'apparence :
 `cap_brut = cap`, `cap_manuel = null`, `offset = 0`. La calibration repart donc
-de la direction déjà corrigée, ce qui est le comportement voulu.
+de la direction déjà corrigée, ce qui est le comportement voulu. La même
+conversion existe ici, dans `_migrer()`, pour le réimport : une seule règle des
+deux côtés, comme pour le cap.
 """
 
 import base64
 import io
 import json
+import warnings
 from PIL import Image, ImageOps
 
 from lecture_exif import SEUIL_PRECISION_M
@@ -90,13 +104,22 @@ VERSION_CARTE = 3
 
 # Fonds de carte. L'ortho IGN est la plus détaillée sur la France ;
 # Esri sert de secours et couvre le monde entier (utile en outre-mer).
+#
+# `zoom_max` est le dernier niveau où le serveur a de VRAIES tuiles. Au-delà,
+# Leaflet agrandit la dernière tuile connue (maxNativeZoom) au lieu d'en
+# réclamer d'inexistantes : le fond devient flou, jamais gris. Une valeur trop
+# haute est donc un défaut visible — c'est ce qui grisait le fond à fort zoom.
+#
+# Mesuré sur data.geopf.fr (TILEMATRIXSET=PM) : la couche ORTHOIMAGERY.ORTHOPHOTOS
+# répond en 404 dès le niveau 20, partout — sur foncier rural comme en plein
+# Paris. 19 n'est pas un compromis prudent, c'est le maximum réel de la couche.
 FONDS_DE_CARTE = {
     "Ortho IGN": {
         "url": ("https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0"
                 "&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&STYLE=normal&TILEMATRIXSET=PM"
                 "&FORMAT=image/jpeg&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}"),
         "attribution": "IGN-F/Géoportail",
-        "zoom_max": 21,
+        "zoom_max": 19,
     },
     "Satellite Esri": {
         "url": ("https://server.arcgisonline.com/ArcGIS/rest/services/"
@@ -144,6 +167,58 @@ def _echapper(texte):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _cap_effectif(point, offset):
+    """LA règle du cap, côté Python — jumelle de capEffectif() dans la page.
+
+    Une direction figée à la main l'emporte et ne suit pas la calibration ;
+    sinon la direction d'origine reçoit l'offset ; sinon il n'y a pas de cône.
+    """
+    if point.get("cap_manuel") is not None:
+        return point["cap_manuel"]
+    if point.get("cap_brut") is None:
+        return None
+    return (point["cap_brut"] + offset) % 360
+
+
+def _point_depuis_photo(photo, identifiant, ordre, largeur_max, qualite):
+    """Bâtit un point de la carte à partir d'une photo analysée.
+
+    C'est le seul endroit où une photo est encodée en base64 : un point déjà
+    présent dans une carte importée n'y repasse jamais (cf. completer_carte).
+    """
+    cap = photo.get("cap")
+    cap_manuel = photo.get("cap_manuel")
+    cap_brut = photo.get("cap_brut")
+    # Une direction effacée à la main (cap absent alors qu'aucune valeur
+    # manuelle ne l'explique) ne doit pas réapparaître sous l'effet de
+    # l'offset : on retire aussi son origine, sans quoi la page la
+    # recalculerait à partir de cap_brut.
+    if cap is None and cap_manuel is None:
+        cap_brut = None
+    return {
+        "id": identifiant,
+        "nom": photo["nom"],
+        "lat": photo["lat"],
+        "lon": photo["lon"],
+        "cap_brut": cap_brut,
+        "cap_manuel": cap_manuel,
+        "cap": cap,
+        "date": photo.get("date_texte", ""),
+        "commentaire": photo.get("commentaire", ""),
+        "masque": False,
+        "ordre": ordre,
+        "precision_m": photo.get("precision_m"),
+        "image": _image_en_base64(photo["chemin"], largeur_max, qualite),
+    }
+
+
+def _assembler_html(donnees):
+    """Injecte l'objet de données dans le gabarit et retourne le HTML complet."""
+    return (_GABARIT.replace("__TITRE__", _echapper(donnees["titre"]))
+                    .replace("__VERSION__", str(donnees["version"]))
+                    .replace("__DONNEES__", _json_pour_html(donnees)))
+
+
 def construire_carte(photos, titre, largeur_max=1600, qualite=80, note="",
                      seuil_precision=SEUIL_PRECISION_M, offset=0.0):
     """Construit le HTML complet de la carte.
@@ -160,32 +235,8 @@ def construire_carte(photos, titre, largeur_max=1600, qualite=80, note="",
              la modifier au lieu de la subir.
     Retourne la chaîne HTML.
     """
-    points = []
-    for index, photo in enumerate(photos):
-        cap = photo.get("cap")
-        cap_manuel = photo.get("cap_manuel")
-        cap_brut = photo.get("cap_brut")
-        # Une direction effacée à la main (cap absent alors qu'aucune valeur
-        # manuelle ne l'explique) ne doit pas réapparaître sous l'effet de
-        # l'offset : on retire aussi son origine, sans quoi la page la
-        # recalculerait à partir de cap_brut.
-        if cap is None and cap_manuel is None:
-            cap_brut = None
-        points.append({
-            "id": index,
-            "nom": photo["nom"],
-            "lat": photo["lat"],
-            "lon": photo["lon"],
-            "cap_brut": cap_brut,
-            "cap_manuel": cap_manuel,
-            "cap": cap,
-            "date": photo.get("date_texte", ""),
-            "commentaire": photo.get("commentaire", ""),
-            "masque": False,
-            "ordre": index,
-            "precision_m": photo.get("precision_m"),
-            "image": _image_en_base64(photo["chemin"], largeur_max, qualite),
-        })
+    points = [_point_depuis_photo(photo, index, index, largeur_max, qualite)
+              for index, photo in enumerate(photos)]
 
     latitudes = [p["lat"] for p in points]
     longitudes = [p["lon"] for p in points]
@@ -202,8 +253,188 @@ def construire_carte(photos, titre, largeur_max=1600, qualite=80, note="",
         "points": points,
     }
 
-    return (_GABARIT.replace("__TITRE__", _echapper(titre))
-                    .replace("__DONNEES__", _json_pour_html(donnees)))
+    return _assembler_html(donnees)
+
+
+# --------------------------------------------------------------------------
+# Réimport : relire une carte déjà générée pour la compléter
+# --------------------------------------------------------------------------
+
+class CarteIllisible(ValueError):
+    """Le fichier fourni n'est pas une carte exploitable par l'outil."""
+
+
+# Balise ouvrante du bloc de données, écrite à l'identique par le gabarit
+# ci-dessous et par documentComplet() côté navigateur.
+_OUVERTURE_DONNEES = '<script id="donnees-carte" type="application/json">'
+
+
+def _corriger_zoom_max(donnees):
+    """Remet à jour le `zoom_max` des fonds de carte connus, sur place.
+
+    Le bloc `fonds` n'est pas du contenu édité par le chargé de projet : c'est
+    de la configuration technique figée à la génération, sans aucune interface
+    pour la modifier dans la page. Une carte produite avant la mesure de
+    couverture porte donc un `zoom_max` trop haut (21 pour l'ortho IGN), ce qui
+    grise le fond à fort zoom — et le conserver tel quel reviendrait à préserver
+    le défaut. Seul ce champ est repris, et seulement pour un fond dont le nom
+    ET l'URL correspondent encore : un fond inconnu ou personnalisé est laissé
+    intact.
+    """
+    fonds = donnees.get("fonds")
+    if not isinstance(fonds, dict):
+        return
+    for nom, fond in fonds.items():
+        reference = FONDS_DE_CARTE.get(nom)
+        if (isinstance(fond, dict) and reference
+                and fond.get("url") == reference["url"]):
+            fond["zoom_max"] = reference["zoom_max"]
+
+
+def _migrer(donnees):
+    """Convertit une carte antérieure au format courant, sur place.
+
+    Transposition fidèle de la fonction JavaScript migrer() de la page : une
+    même règle des deux côtés. Une carte version 2 ne portait qu'un champ
+    `cap`, offset et corrections déjà appliqués ; on le reprend comme direction
+    d'origine avec un offset nul, ce qui laisse la carte rigoureusement
+    identique à l'écran tout en la rendant calibrable.
+    """
+    if not donnees.get("version", 0) >= VERSION_CARTE:
+        for point in donnees["points"]:
+            point["cap_brut"] = point.get("cap")
+        donnees["offset"] = 0
+        donnees["version"] = VERSION_CARTE
+    if not isinstance(donnees.get("offset"), (int, float)):
+        donnees["offset"] = 0
+    for point in donnees["points"]:
+        point.setdefault("cap_brut", None)
+        point.setdefault("cap_manuel", None)
+    _corriger_zoom_max(donnees)
+    return donnees
+
+
+def extraire_donnees(html):
+    """Relit le bloc `#donnees-carte` d'une carte générée par l'outil.
+
+    Retourne l'objet de données, migré au format courant. C'est ce bloc qui
+    fait foi : il porte toutes les éditions faites dans le navigateur
+    (commentaires, corbeille, calibration, caps figés, ordre, titre).
+
+    Le découpage est sûr sans analyse HTML : `_json_pour_html` échappe les
+    « < » en `\\u003c`, aucun « < » littéral ne peut donc figurer dans le JSON
+    et le premier `</script>` qui suit la balise ouvrante est bien le
+    terminateur du bloc.
+
+    Lève CarteIllisible si le fichier n'est pas une carte exploitable.
+    """
+    debut = html.find(_OUVERTURE_DONNEES)
+    if debut == -1:
+        raise CarteIllisible(
+            "Ce fichier n'est pas une carte générée par l'outil : son bloc de "
+            "données est introuvable. Déposez le fichier HTML produit par cette "
+            "application (ou réenregistré depuis la carte, bouton 💾)."
+        )
+    debut += len(_OUVERTURE_DONNEES)
+    fin = html.find("</script>", debut)
+    if fin == -1:
+        raise CarteIllisible("Carte abîmée : son bloc de données n'est pas refermé.")
+
+    try:
+        donnees = json.loads(html[debut:fin])
+    except json.JSONDecodeError as erreur:
+        raise CarteIllisible(
+            f"Carte abîmée : son bloc de données n'est pas lisible ({erreur.msg}, "
+            f"caractère {erreur.pos})."
+        ) from None
+
+    if not isinstance(donnees, dict) or not isinstance(donnees.get("points"), list):
+        raise CarteIllisible(
+            "Carte abîmée : son bloc de données ne décrit pas une liste de photos."
+        )
+
+    if donnees.get("version", 0) > VERSION_CARTE:
+        warnings.warn(
+            f"Cette carte est au format {donnees['version']}, plus récent que "
+            f"celui connu ici ({VERSION_CARTE}). La lecture est tentée quand même, "
+            "mais des informations récentes peuvent être perdues : vérifiez la "
+            "carte complétée avant de la diffuser.",
+            stacklevel=2,
+        )
+    return _migrer(donnees)
+
+
+def photos_nouvelles(donnees, photos):
+    """Filtre les photos absentes de la carte, dans l'ordre reçu.
+
+    Le repère est le couple (nom de fichier, date affichée) : redéposer le même
+    lot, ou une archive qui recoupe le précédent, n'ajoute pas de doublons. Deux
+    photos homonymes prises à des instants différents restent bien distinctes.
+    """
+    presentes = {(point.get("nom"), point.get("date", ""))
+                 for point in donnees["points"]}
+    retenues = []
+    for photo in photos:
+        cle = (photo["nom"], photo.get("date_texte", ""))
+        if cle in presentes:
+            continue
+        presentes.add(cle)      # deux fois la même photo dans le lot déposé
+        retenues.append(photo)
+    return retenues
+
+
+def completer_carte(html_existant, nouvelles_photos, largeur_max=1600, qualite=80,
+                    titre=None):
+    """Ajoute des photos à une carte déjà générée, sans toucher au reste.
+
+    Le bloc `#donnees-carte` fait foi : on le relit, on y ajoute les points des
+    photos absentes, on réémet le HTML depuis cet objet enrichi. Les points
+    existants ne sont jamais reconstruits — leur image base64 et leurs éditions
+    (commentaire, corbeille, nom, ordre, direction figée) sont reprises telles
+    quelles, ce qui garantit la fidélité et évite un ré-encodage inutile.
+
+    titre : nouveau titre de la carte. Laissé à None (ou vide), le titre de la
+            carte importée est conservé. C'est le seul champ de tête que le
+            réimport permet de changer — pratique pour dater une nouvelle
+            version (« Visite de site — relevé du 2 août »).
+
+    Note, calibration, seuil de précision et fonds de carte viennent de la carte
+    importée et ne sont jamais écrasés.
+
+    Retourne la chaîne HTML de la carte complétée.
+    """
+    donnees = extraire_donnees(html_existant)
+    points = donnees["points"]
+
+    if titre and str(titre).strip():
+        donnees["titre"] = titre
+
+    # Identifiants et rangs repris à la suite : un id n'est jamais réattribué,
+    # et les nouvelles photos se rangent après celles déjà présentes.
+    identifiant = max((point.get("id", -1) for point in points), default=-1) + 1
+    ordre = max((point.get("ordre", -1) for point in points), default=-1) + 1
+
+    for photo in photos_nouvelles(donnees, nouvelles_photos):
+        point = _point_depuis_photo(photo, identifiant, ordre, largeur_max, qualite)
+        # La calibration de la carte importée s'applique aussi aux arrivantes :
+        # `cap` est une valeur déduite, on l'écrit déjà juste (la page la
+        # recalculerait de toute façon à l'ouverture).
+        point["cap"] = _cap_effectif(point, donnees["offset"])
+        points.append(point)
+        identifiant += 1
+        ordre += 1
+
+    # Recadrage sur l'ensemble des points visibles, pour que les photos ajoutées
+    # soient à l'écran à l'ouverture. Une carte entièrement à la corbeille garde
+    # son cadrage précédent, faute de mieux.
+    visibles = [point for point in points if not point.get("masque")]
+    if visibles:
+        donnees["centre"] = [
+            sum(point["lat"] for point in visibles) / len(visibles),
+            sum(point["lon"] for point in visibles) / len(visibles),
+        ]
+
+    return _assembler_html(donnees)
 
 
 # Le gabarit utilise des marqueurs __XXX__ plutôt que le formatage Python,
@@ -218,7 +449,7 @@ _GABARIT = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="carte-photos-version" content="3">
+<meta name="carte-photos-version" content="__VERSION__">
 <title>__TITRE__</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

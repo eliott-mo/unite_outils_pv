@@ -21,6 +21,7 @@ Lancement en local :  streamlit run app.py
 import base64
 import os
 import tempfile
+import warnings
 import zipfile
 
 import pandas as pd
@@ -32,7 +33,8 @@ import ocr_position
 from detection_cap import SEUIL_CONFIANCE
 from lecture_exif import SEUIL_PRECISION_M
 from lecture_photo import lire_photo
-from generation_html import construire_carte
+from generation_html import (CarteIllisible, completer_carte, construire_carte,
+                             extraire_donnees, photos_nouvelles)
 from apercu_boussole import boussole
 
 EXTENSIONS_IMAGE = formats_images.EXTENSIONS_IMAGE
@@ -48,9 +50,9 @@ PRESETS_QUALITE = {
 }
 
 st.set_page_config(
-	page_title="Visite de site - Rapport photos", 
-	page_icon="📸",
-	layout="wide"
+    page_title="Visite de site - Rapport photos",
+    page_icon="📸",
+    layout="wide",
 )
 
 
@@ -333,6 +335,19 @@ with st.expander("ℹ️ Mode d'emploi et limites", expanded=False):
    **.zip**, au choix —, vérifier le tableau, puis télécharger la carte.
 4. Ouvrir la carte et cliquer sur ✏️ pour **ajuster les directions** : c'est là,
    sur le fond satellite, qu'un décalage de boussole se voit et se corrige.
+5. Plus tard, pour **ajouter des photos à une carte déjà annotée** : choisir
+   *Compléter une carte existante* tout en haut, déposer la carte `.html`, puis
+   les nouvelles photos.
+
+**Compléter une carte existante**
+Déposer une carte `.html` déjà produite ajoute les nouvelles photos **sans rien
+perdre** de ce qui y a été fait dans le navigateur : commentaires, noms, ordre,
+corbeille, calibration de la boussole et directions figées à la main. Les photos
+déjà présentes ne sont ni retraitées ni dupliquées, et la calibration de la carte
+s'applique aussi aux directions des arrivantes. Le **titre** est pré-rempli avec
+celui de la carte importée et reste modifiable, pour dater la nouvelle version.
+Une photo **renommée** dans l'éditeur a perdu son nom de fichier : si vous la
+redéposez, elle sera ajoutée une seconde fois.
 
 **Formats acceptés**
 JPEG, PNG, WEBP, TIFF et **HEIC** (format par défaut des iPhone), ainsi que les
@@ -386,6 +401,50 @@ if not ocr_position.tesseract_disponible():
 for cle, valeur_initiale in [("photos", []), ("ecartees", []),
                              ("commentaires", {}), ("version_deposoir", 0)]:
     st.session_state.setdefault(cle, valeur_initiale)
+
+# Première question posée, avant même les photos : celui qui vient compléter une
+# carte doit voir la fonctionnalité tout de suite, pas la découvrir en bas de
+# page une fois ses photos traitées.
+mode = st.radio(
+    "Que voulez-vous faire ?",
+    ["🆕 Nouvelle carte", "🔄 Compléter une carte existante"],
+    horizontal=True,
+    help="« Compléter » ajoute vos photos à une carte déjà produite par cet "
+         "outil, en conservant tout ce qui y a été édité dans le navigateur.",
+)
+complement = mode.endswith("existante")
+
+html_existant, donnees_existantes = None, None
+if complement:
+    carte_existante = st.file_uploader(
+        "Carte à compléter (.html)",
+        type=["html"],
+        key="carte_existante",
+        help="La carte HTML déjà produite par cet outil. Tout ce qui y a été "
+             "édité — commentaires, noms, corbeille, ordre, calibration, "
+             "directions figées — est conservé, et les photos déjà présentes "
+             "ne sont ni retraitées ni dupliquées.",
+    )
+    if carte_existante is not None:
+        html_existant = carte_existante.getvalue().decode("utf-8", errors="replace")
+        try:
+            # Lecture immédiate : mieux vaut signaler un fichier inexploitable
+            # maintenant qu'après avoir traité puis encodé toutes les photos.
+            with warnings.catch_warnings(record=True) as alertes:
+                warnings.simplefilter("always")
+                donnees_existantes = extraire_donnees(html_existant)
+            for alerte in alertes:
+                st.warning(str(alerte.message))
+            st.success(
+                f"Carte « {donnees_existantes['titre']} » lue — "
+                f"{len(donnees_existantes['points'])} photo(s) déjà présente(s). "
+                "Déposez maintenant les photos à ajouter."
+            )
+        except CarteIllisible as erreur:
+            st.error(str(erreur))
+            html_existant = None
+    else:
+        st.info("Déposez la carte à compléter, puis les photos à y ajouter.")
 
 # La version fait partie de la key : l'incrémenter après un traitement recrée un
 # déposoir vide (voir traiter()). Le déposoir ne montre donc jamais que ce qui
@@ -579,19 +638,54 @@ with st.expander("👁️ Vérifier visuellement une photo"):
 
 st.subheader("Génération de la carte")
 
+# La carte à compléter, elle, a été demandée tout en haut : ce qui reste à
+# régler ici, c'est le titre et la qualité des photos ajoutées.
+if donnees_existantes is not None:
+    deja = len(donnees_existantes["points"])
+    a_ajouter = photos_nouvelles(donnees_existantes, photos)
+    st.info(
+        f"**Carte « {donnees_existantes['titre']} » — {deja} photo(s) déjà "
+        f"présente(s).** {len(a_ajouter)} photo(s) du lot seront ajoutées"
+        + (f", {len(photos) - len(a_ajouter)} déjà présente(s) seront ignorée(s)."
+           if len(a_ajouter) < len(photos) else ".")
+    )
+
 col_gauche, col_droite = st.columns(2)
-titre = col_gauche.text_input("Titre de la carte", value="Visite de site")
+if donnees_existantes is not None:
+    # Titre pré-rempli avec celui de la carte importée, mais modifiable : c'est
+    # l'occasion de dater la nouvelle version. La calibration, elle, reste celle
+    # de la carte — elle ne se règle que dans l'éditeur, sur le fond satellite.
+    titre = col_gauche.text_input(
+        "Titre de la carte", value=donnees_existantes["titre"],
+        help="Pré-rempli avec le titre de la carte importée. Modifiez-le pour "
+             "dater cette nouvelle version, par exemple.",
+    )
+    col_gauche.caption("La calibration de la carte importée est conservée.")
+else:
+    titre = col_gauche.text_input("Titre de la carte", value="Visite de site")
 preset = col_droite.selectbox("Qualité des photos", list(PRESETS_QUALITE), index=1)
 largeur_max, qualite = PRESETS_QUALITE[preset]
 
-poids_estime = len(photos) * {1024: 0.25, 1280: 0.40, 1600: 0.75}[largeur_max]
-st.caption(f"Poids estimé du fichier : environ **{poids_estime:.1f} Mo**.")
+# En complément, seules les photos ajoutées sont encodées ici : le poids de la
+# carte importée s'ajoute tel quel, la qualité choisie ne s'applique qu'aux
+# arrivantes.
+nb_encodees = len(a_ajouter) if donnees_existantes is not None else len(photos)
+poids_estime = nb_encodees * {1024: 0.25, 1280: 0.40, 1600: 0.75}[largeur_max]
+if donnees_existantes is not None:
+    st.caption(f"Poids ajouté au fichier importé : environ **{poids_estime:.1f} Mo** "
+               f"({len(html_existant.encode('utf-8')) / 1e6:.1f} Mo actuellement).")
+else:
+    st.caption(f"Poids estimé du fichier : environ **{poids_estime:.1f} Mo**.")
 
-if st.button("🗺️ Générer la carte", type="primary", use_container_width=True):
+bouton = "🗺️ Compléter la carte" if html_existant else "🗺️ Générer la carte"
+if st.button(bouton, type="primary", use_container_width=True):
     with st.spinner("Génération en cours…"):
-        html = construire_carte(photos, titre, largeur_max, qualite)
+        if html_existant:
+            html = completer_carte(html_existant, photos, largeur_max, qualite, titre)
+        else:
+            html = construire_carte(photos, titre, largeur_max, qualite)
 
-    st.success("Carte générée.")
+    st.success("Carte complétée." if html_existant else "Carte générée.")
     nom_fichier = "".join(c if c.isalnum() or c in " -_" else "_" for c in titre).strip()
     st.download_button(
         "⬇️ Télécharger la carte HTML",

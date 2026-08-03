@@ -42,6 +42,13 @@ EXTENSIONS_IMAGE = formats_images.EXTENSIONS_IMAGE
 # Types acceptés par le dépôt : les photos une par une ET l'archive ZIP.
 TYPES_ACCEPTES = [extension.lstrip(".") for extension in EXTENSIONS_IMAGE] + ["zip"]
 
+# Poids maximal d'un lot déposé en une fois, en Mo. Au-delà, le décodage de
+# toutes les photos d'un coup ferait dépasser la RAM de l'hébergement (~1 Go sur
+# le plan gratuit Streamlit Cloud) et planterait l'app. Le contrôle porte sur le
+# poids, pas le nombre de photos : 100 photos de téléphone (~3 Mo) pèsent moins
+# en RAM que 30 photos de drone (~15 Mo).
+SEUIL_LOT_MO = 350  # marge sous la limite ~1 Go de Streamlit Cloud ; à affiner empiriquement
+
 # Compromis résolution / poids du fichier final, mesuré sur photos 12 Mpx.
 PRESETS_QUALITE = {
     "Léger — envoi par mail (~0,25 Mo/photo)":            (1024, 72),
@@ -469,13 +476,36 @@ ecartees = st.session_state["ecartees"]
 # session_state["photos"] et ne sont jamais réanalysés.
 en_attente = fichiers
 
+# Poids du dépôt en attente, mesuré sur les octets déjà en main (.size de chaque
+# UploadedFile) : aucune photo n'est encore décodée à ce stade. Le garde-fou
+# agit donc AVANT tout décodage/base64, là où la RAM n'a pas encore gonflé.
+poids_lot_mo = sum(f.size for f in en_attente) / 1e6
+lot_trop_lourd = poids_lot_mo > SEUIL_LOT_MO
+
 if en_attente:
     nombre = sum(compter_images(f) for f in en_attente)
     st.info(f"**{nombre} photo(s) prête(s) à traiter.** "
             "Vous pouvez encore en déposer avant de lancer le traitement.")
+    # Indicateur discret pour anticiper : l'utilisateur voit le lot approcher du
+    # seuil avant de le franchir.
+    st.caption(f"Lot : {poids_lot_mo:.0f} / {SEUIL_LOT_MO} Mo")
+
+    if lot_trop_lourd:
+        # Le vidage du déposoir après traitement libère les octets bruts : seul
+        # le base64 réduit (~0,4 Mo/photo) subsiste d'un lot à l'autre. Découper
+        # en plusieurs dépôts contourne donc réellement la limite mémoire — c'est
+        # ce que le message invite à faire.
+        st.error(
+            f"Lot trop volumineux : {poids_lot_mo:.0f} Mo (limite {SEUIL_LOT_MO} Mo). "
+            "Traitez-le en plusieurs fois : déposez une première partie, cliquez "
+            "sur Traiter, puis ajoutez le reste en mode Ajouter."
+        )
 
     if not photos:
-        if st.button("▶️ Traiter les photos", type="primary", use_container_width=True):
+        # disabled tant que le dépassement persiste : le clic est sans effet, donc
+        # aucun décodage ne démarre.
+        if st.button("▶️ Traiter les photos", type="primary", use_container_width=True,
+                     disabled=lot_trop_lourd):
             traiter(en_attente, remplacer=False)
     else:
         # Un lot est déjà traité : à l'utilisateur de dire quoi faire des nouvelles.
@@ -483,10 +513,12 @@ if en_attente:
         gauche, droite = st.columns(2)
         if gauche.button(f"➕ Ajouter au lot ({len(photos)} photo(s) déjà traitée(s))",
                          type="primary", use_container_width=True,
+                         disabled=lot_trop_lourd,
                          help="Les photos déjà traitées sont conservées telles "
                               "quelles : elles ne sont pas réanalysées."):
             traiter(en_attente, remplacer=False)
         if droite.button("♻️ Remplacer le lot", use_container_width=True,
+                         disabled=lot_trop_lourd,
                          help="Le lot précédent est oublié, commentaires compris. "
                               "Seules les nouvelles photos sont traitées."):
             traiter(en_attente, remplacer=True)

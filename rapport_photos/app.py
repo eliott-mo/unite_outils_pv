@@ -467,6 +467,18 @@ fichiers = st.file_uploader(
          "Rien n'est traité tant que vous n'avez pas cliqué sur le bouton.",
 ) or []
 
+# Consigne affichée d'emblée, avant tout dépassement : un fichier plus lourd que
+# le plafond est refusé par Streamlit côté navigateur, avec un message générique
+# qu'on ne peut pas personnaliser. Autant expliquer la marche à suivre en amont,
+# pour que ce refus ne surprenne pas — en particulier sur un gros ZIP, qu'on ne
+# peut pas « découper » dans l'app.
+st.caption(
+    f"Un seul dépôt doit rester sous **{SEUIL_LOT_MO} Mo** (mémoire de "
+    f"l'hébergement) ; un fichier plus lourd est refusé. Pour un gros ZIP : "
+    "faites-en plusieurs plus petits, ou déposez les photos directement, en "
+    "plusieurs fois (mode *Ajouter*)."
+)
+
 photos = st.session_state["photos"]
 ecartees = st.session_state["ecartees"]
 
@@ -498,7 +510,8 @@ if en_attente:
         st.error(
             f"Lot trop volumineux : {poids_lot_mo:.0f} Mo (limite {SEUIL_LOT_MO} Mo). "
             "Traitez-le en plusieurs fois : déposez une première partie, cliquez "
-            "sur Traiter, puis ajoutez le reste en mode Ajouter."
+            "sur Traiter, puis ajoutez le reste en mode Ajouter. Si c'est un ZIP "
+            "unique, faites-en plutôt plusieurs plus petits."
         )
 
     if not photos:

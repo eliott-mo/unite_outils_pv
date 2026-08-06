@@ -135,100 +135,195 @@ def to_dms(deg, is_lat):
 
 def calcul_extremaux(terrain, tr, echelle=5000):
     """
-    Selectionne 4 points bien repartis sur le contour reel du terrain.
+    Selectionne 4 a 6 points de coordonnees sur le contour du terrain.
 
-    Algorithme
-    ----------
-    0. Echantillonnage de N_ECH points candidats sur le contour (et non sur
-       l'enveloppe convexe) : les points restent sur le perimetre meme si la
-       forme est concave, allongee ou composee de plusieurs parcelles, et le
-       resultat ne depend plus du nombre de sommets (un triangle fonctionne).
-    1. A = candidat le plus au nord (max Y).
-    2. B = candidat maximisant la distance a A.
-    3. C = candidat maximisant la distance minimale a {A, B} (maximin).
-    4. D = candidat maximisant la distance minimale a {A, B, C} (maximin).
+    Methode
+    -------
+    1. Les 4 extremes cardinaux : le plus au nord, a l'est, au sud, a l'ouest.
+    2. Si deux extremes tombent au meme endroit (un angle peut etre a la fois
+       le plus au nord ET le plus a l'ouest), on n'en garde qu'un et on place
+       l'autre ailleurs sur le contour, de preference sur un angle marque meme
+       s'il ne s'agit pas d'un extreme.
+    3. S'il subsiste une portion de perimetre superieure a GAP_MAX sans aucun
+       point (forme allongee ou tordue), on ajoute 1 ou 2 points, sans jamais
+       depasser N_MAX au total.
+    4. Deux points ne sont jamais distants de moins de MIN_D.
 
-    Chaque point recoit ensuite l'une des 4 directions cardinales d'annotation,
-    attribuee sans doublon selon sa direction sortante depuis le centroide.
+    Les candidats sont pris sur le contour REEL et non sur l'enveloppe convexe :
+    les points restent sur le perimetre y compris sur forme concave ou
+    multi-parcelles, et un triangle fonctionne comme un polygone a 200 cotes.
+
+    Les etiquettes suivent le perimetre : A est le point le plus au nord, les
+    suivants se lisent en tournant autour de l'emprise.
     """
-    cx, cy   = terrain.centroid.x, terrain.centroid.y
+    from shapely.geometry import Point as _Pt, LineString as _LS
 
+    cx, cy   = terrain.centroid.x, terrain.centroid.y
     minx, miny, maxx, maxy = terrain.bounds
     M_PER_PT = echelle * 0.0254 / 72   # metres par point typographique
-    BOX_W, BOX_H = 92, 52              # taille boite en pts (fixe — la fonte est fixe)
+    BOX_W, BOX_H = 92, 52              # taille boite en pts (la fonte est fixe)
 
     # PUSH : depasse la demi-largeur du terrain + marge lisible, cap a 150 pts
     terrain_hw = max(maxx - minx, maxy - miny) / 2
     PUSH = max(min(int(terrain_hw / M_PER_PT) + 25, 150), 40)
 
-    N_ECH = 400   # points candidats echantillonnes sur le contour
-    # Candidats sur le contour REEL du terrain (et non le hull) : garantit que les
-    # points sont sur le perimetre, y compris sur terrain concave ou multi-parcelles
-    _bnd   = terrain.boundary
-    _cand  = [np.array(_bnd.interpolate(i / N_ECH, normalized=True).coords)[0][:2]
-              for i in range(N_ECH)]
-    # A = point le plus au nord (convention conservee)
-    _sel = [int(np.argmax([c[1] for c in _cand]))]
-    # B, C, D = selection gloutonne du point le plus eloigne des deja retenus (maximin)
-    for _ in range(3):
-        _sel.append(max(
-            (k for k in range(N_ECH) if k not in _sel),
-            key=lambda k: min(math.dist(_cand[k], _cand[s]) for s in _sel)
-        ))
+    bnd     = terrain.boundary
+    PERIM   = bnd.length
+    MIN_D   = 0.05 * PERIM    # ecart mini entre deux points (euclidien)
+    GAP_MAX = 0.30 * PERIM    # portion de perimetre toleree sans aucun point
+    N_MAX   = 6
+    ANG_NET = 25.0            # rupture (deg) au-dela de laquelle c'est un angle
 
-    # Offsets d'annotation : 4 directions cardinales, une par point.
+    # -- Pool de candidats : sommets reels + echantillonnage regulier ---------
+    # Les sommets garantissent des extremes EXACTS ; l'echantillonnage donne de
+    # quoi combler les trous sur les longs cotes depourvus de sommet.
+    N_ECH = 720
+    cand  = []   # [x, y, abscisse curviligne, angle de rupture (deg), est_un_sommet]
+
+    _lignes = list(bnd.geoms) if bnd.geom_type.startswith("Multi") else [bnd]
+    for _ln in _lignes:
+        _cs    = list(_ln.coords)
+        _ferme = _cs[0] == _cs[-1]
+        _nb    = len(_cs) - 1 if _ferme else len(_cs)
+        for _i in range(_nb):
+            _x, _y = _cs[_i][0], _cs[_i][1]
+            _av = _cs[_i - 1] if (_i > 0 or _ferme) else None
+            _ap = _cs[_i + 1] if _i + 1 < len(_cs) else (_cs[1] if _ferme else None)
+            _ang = 0.0
+            if _av is not None and _ap is not None:
+                _v1 = (_x - _av[0], _y - _av[1])
+                _v2 = (_ap[0] - _x, _ap[1] - _y)
+                _n1, _n2 = math.hypot(*_v1), math.hypot(*_v2)
+                if _n1 > 1e-9 and _n2 > 1e-9:
+                    _co = (_v1[0] * _v2[0] + _v1[1] * _v2[1]) / (_n1 * _n2)
+                    _ang = math.degrees(math.acos(max(-1.0, min(1.0, _co))))
+            cand.append([_x, _y, bnd.project(_Pt(_x, _y)), _ang, True])
+
+    for _i in range(N_ECH):
+        _s = PERIM * _i / N_ECH
+        _p = bnd.interpolate(_s)
+        cand.append([_p.x, _p.y, _s, 0.0, False])
+
+    def _libre(k, sel):
+        return all(math.dist(cand[k][:2], cand[j][:2]) >= MIN_D for j in sel)
+
+    def _angles(dispo):
+        """Ne retient que les VRAIS sommets presentant une rupture nette.
+        Un point pose au milieu d'un cote droit ne renseigne rien sur l'emprise :
+        un point de coordonnees doit tomber sur un angle identifiable du terrain."""
+        return [i for i in dispo if cand[i][4] and cand[i][3] >= ANG_NET]
+
+    # Proeminence : eloignement au centroide, rapporte au plus eloigne. Un angle
+    # niche au coeur de la forme (jonction entre deux lobes, fond d'echancrure)
+    # ne dit rien de l'etendue du site ; un angle peripherique la borne.
+    _DMAX = max(math.hypot(c[0] - cx, c[1] - cy) for c in cand) or 1.0
+
+    def _score(k, sel):
+        """Qualite d'un candidat : nettete de l'angle et proeminence.
+
+        La proeminence pese le double : un angle vif mais niche au coeur de la
+        forme (jonction entre deux lobes) borne moins bien l'emprise qu'un angle
+        plus doux mais peripherique.
+
+        Aucun terme d'eloignement ici : MIN_D l'impose deja comme contrainte
+        dure, et l'ajouter au score serait contre-productif — il mesure la
+        distance au point retenu le plus PROCHE, si bien qu'un candidat central
+        est "loin de tous" des que les retenus sont peripheriques, ce qui
+        revient a recompenser le centre.
+        """
+        return (1.0 * min(cand[k][3], 90.0) / 90.0
+                + 2.0 * math.hypot(cand[k][0] - cx, cand[k][1] - cy) / _DMAX)
+
+    # -- 1 et 2. Extremes cardinaux, repli sur un angle en cas de doublon -----
+    sel = []
+    for _cle in (lambda c: c[1], lambda c: c[0], lambda c: -c[1], lambda c: -c[0]):
+        _k = max(range(len(cand)), key=lambda i: _cle(cand[i]))
+        if _libre(_k, sel):
+            sel.append(_k)
+            continue
+        _dispo = [i for i in range(len(cand)) if _libre(i, sel)]
+        if _dispo:
+            sel.append(max(_angles(_dispo) or _dispo, key=lambda i: _score(i, sel)))
+
+    # -- 3. Combler les portions de perimetre depourvues de point -------------
+    while len(sel) < N_MAX:
+        _abs   = sorted(cand[i][2] for i in sel)
+        _trous = [(_abs[(j + 1) % len(_abs)] - _abs[j]) % PERIM
+                  for j in range(len(_abs))]
+        _gmax  = max(_trous)
+        if _gmax <= GAP_MAX:
+            break
+        # On cherche DANS le trou, et on y prend le meilleur angle plutot que le
+        # point le plus proche du milieu : viser le milieu tombe souvent au
+        # milieu d'un cote droit, sans interet pour decrire l'emprise.
+        _deb    = _abs[_trous.index(_gmax)]
+        _dispo  = [i for i in range(len(cand)) if _libre(i, sel)]
+        _dedans = [i for i in _dispo if 0 < (cand[i][2] - _deb) % PERIM < _gmax]
+        if not _dedans:
+            break
+        sel.append(max(_angles(_dedans) or _dedans, key=lambda i: _score(i, sel)))
+
+    # -- Ordre de lecture : A au nord, puis on tourne le long du perimetre ----
+    _sA = cand[max(sel, key=lambda i: cand[i][1])][2]
+    sel.sort(key=lambda i: (cand[i][2] - _sA) % PERIM)
+
+    # -- Encarts : 8 directions possibles, une seule par point ----------------
+    _d8 = int(PUSH * 0.7)
     _tmpl = [
-        ((-BOX_W // 2,  PUSH),           (0.0,  1.0)),   # N
-        ((PUSH, -BOX_H // 2),            (1.0,  0.0)),   # E
-        ((-BOX_W // 2, -(BOX_H + PUSH)), (0.0, -1.0)),   # S
-        ((-(BOX_W + PUSH), -BOX_H // 2), (-1.0, 0.0)),   # O
+        ((-BOX_W // 2, PUSH),              ( 0.00,  1.00)),   # N
+        ((_d8, _d8),                       ( 0.71,  0.71)),   # NE
+        ((PUSH, -BOX_H // 2),              ( 1.00,  0.00)),   # E
+        ((_d8, -(BOX_H + _d8)),            ( 0.71, -0.71)),   # SE
+        ((-BOX_W // 2, -(BOX_H + PUSH)),   ( 0.00, -1.00)),   # S
+        ((-(BOX_W + _d8), -(BOX_H + _d8)), (-0.71, -0.71)),   # SO
+        ((-(BOX_W + PUSH), -BOX_H // 2),   (-1.00,  0.00)),   # O
+        ((-(BOX_W + _d8), _d8),            (-0.71,  0.71)),   # NO
     ]
 
-    # Position et direction sortante (depuis le centroide) des 4 points retenus
-    _pxy, _dirs = [], []
-    for k in _sel:
-        px, py = float(_cand[k][0]), float(_cand[k][1])
-        _vx, _vy = px - cx, py - cy
-        _nrm = max(math.hypot(_vx, _vy), 1e-9)
-        _pxy.append((px, py))
-        _dirs.append((_vx / _nrm, _vy / _nrm))
+    _pts = [(cand[i][0], cand[i][1]) for i in sel]
 
-    # Longueur de la ligne de rappel qui traverserait l'emprise
-    from shapely.geometry import LineString as _LS
     def _coupe(pt, adx, ady):
-        bx = pt[0] + (adx + BOX_W / 2) * M_PER_PT
-        by = pt[1] + (ady + BOX_H / 2) * M_PER_PT
+        """Longueur de ligne de rappel qui traverserait l'emprise."""
+        _bx = pt[0] + (adx + BOX_W / 2) * M_PER_PT
+        _by = pt[1] + (ady + BOX_H / 2) * M_PER_PT
         try:
-            return _LS([pt, (bx, by)]).intersection(terrain).length
+            return _LS([pt, (_bx, _by)]).intersection(terrain).length
         except Exception:
             return 0.0
 
-    # Attribution optimale sur les 24 permutations : on minimise d'abord la
-    # longueur totale de fleche traversant le terrain (une ligne de rappel ne
-    # doit pas couper l'emprise), puis on maximise l'alignement sortant.
-    # L'heuristique par centroide seule echoue sur les formes allongees en
-    # diagonale : le dernier point recoit par elimination une direction qui
-    # renvoie la fleche a travers la parcelle.
-    import itertools as _it
-    _best, _bkey = None, None
-    for _perm in _it.permutations(range(len(_tmpl))):
-        _c = _a = 0.0
-        for _i, _t in enumerate(_perm):
-            (adx, ady), (dux, duy) = _tmpl[_t]
-            _c += _coupe(_pxy[_i], adx, ady)
-            _a += _dirs[_i][0] * dux + _dirs[_i][1] * duy
-        _key = (round(_c, 1), -_a)
-        if _bkey is None or _key < _bkey:
-            _bkey, _best = _key, _perm
+    # Cout : traversee de l'emprise d'abord (une fleche ne doit pas couper le
+    # terrain), alignement avec la direction sortante ensuite.
+    _cout = np.zeros((len(_pts), len(_tmpl)))
+    for _i, (_px, _py) in enumerate(_pts):
+        _vx, _vy = _px - cx, _py - cy
+        _nn = max(math.hypot(_vx, _vy), 1e-9)
+        _vx, _vy = _vx / _nn, _vy / _nn
+        for _t, ((_adx, _ady), (_ux, _uy)) in enumerate(_tmpl):
+            _cout[_i, _t] = (round(_coupe((_px, _py), _adx, _ady), 1) * 1000.0
+                             - (_vx * _ux + _vy * _uy))
+
+    try:
+        from scipy.optimize import linear_sum_assignment as _lsa
+        _lig, _col = _lsa(_cout)
+        _attr = dict(zip(_lig.tolist(), _col.tolist()))
+    except Exception:
+        _attr = {}
+        _li, _lt = set(range(len(_pts))), set(range(len(_tmpl)))
+        while _li:
+            _i, _t = min(((i, t) for i in _li for t in _lt),
+                         key=lambda p: _cout[p[0], p[1]])
+            _attr[_i] = _t
+            _li.discard(_i)
+            _lt.discard(_t)
 
     result = []
-    for _i, lbl in enumerate("ABCD"[:len(_sel)]):
-        px, py = _pxy[_i]
-        (adx, ady), (dux, duy) = _tmpl[_best[_i]]
-        lon, lat = tr.transform(px, py)
+    for _i, lbl in enumerate("ABCDEF"[:len(sel)]):
+        _px, _py = _pts[_i]
+        (adx, ady), (dux, duy) = _tmpl[_attr[_i]]
+        lon, lat = tr.transform(_px, _py)
         result.append({
             "label":  "Pt {}".format(lbl),
-            "x": px, "y": py,
+            "x": _px, "y": _py,
             "lat":    to_dms(lat, True),
             "lon":    to_dms(lon, False),
             "ann_dx": adx, "ann_dy": ady,

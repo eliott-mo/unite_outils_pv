@@ -908,7 +908,7 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
     # Périmètre 600m — halo sombre + trait blanc pour lisibilité sur fond aérien
     draw_geom(ax, buf600, fc="none", ec="#333333", lw=3.5, alpha_fill=0, ls=(0,(4,5)), zorder=2)
     draw_geom(ax, buf600, fc="none", ec="#FFFFFF", lw=1.8, alpha_fill=0, ls=(0,(4,5)), zorder=2)
-    draw_geom(ax, terrain,  fc="none",    ec="#CC0000", lw=2.5, alpha_fill=0,    ls="-",       zorder=10)
+    draw_geom(ax, terrain,  fc="none",    ec="#CC0000", lw=1.5, alpha_fill=0,    ls="-",       zorder=10)
 
     # ── Zone capteurs : tirets-points bleu roi, 1 tracé par cluster
     _ZC_LS = (0, (6, 2, 1, 2))
@@ -916,8 +916,8 @@ def generer_carte(shp_path, nom_projet, recul_capteurs=10, urbanisme="",
         for cluster in capteurs_clusters:
             if cluster is None or cluster.is_empty:
                 continue
-            draw_geom(ax, cluster, fc="none", ec="#000000", lw=2.8, alpha_fill=0, ls=_ZC_LS, zorder=5)
-            draw_geom(ax, cluster, fc="none", ec="#1A6FBF", lw=1.5, alpha_fill=0, ls=_ZC_LS, zorder=5)
+            draw_geom(ax, cluster, fc="none", ec="#000000", lw=2.3, alpha_fill=0, ls=_ZC_LS, zorder=5)
+            draw_geom(ax, cluster, fc="none", ec="#1A6FBF", lw=1, alpha_fill=0, ls=_ZC_LS, zorder=5)
     else:
         # Aucun KML : zone capteurs standard (buffer négatif terrain)
         draw_geom(ax, capteurs, fc="none", ec="#000000", lw=2.8, alpha_fill=0, ls=_ZC_LS, zorder=5)
